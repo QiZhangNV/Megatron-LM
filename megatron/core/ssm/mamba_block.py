@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -299,7 +299,10 @@ class MambaStack(MegatronModule):
 
         if (
             (
-                (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
+                (
+                    self.config.cuda_graph_impl == "local"
+                    and "full_iteration" not in self.config.cuda_graph_scope
+                )
                 or self.config.flash_decode
             )
             and inference_context
