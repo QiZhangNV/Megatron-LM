@@ -664,13 +664,13 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
         del self.stashed_tp_group
         self.init_finished = True
 
-    def forward(self, x, m_splits):
+    def forward(self, x, m_splits, is_device_initialized=False):
         """Forward."""
         assert self.init_finished
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+        out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch, is_device_initialized=is_device_initialized)
         self.is_first_microbatch = False
 
         # Kitchen only returns a tuple when return_bias is True, otherwise

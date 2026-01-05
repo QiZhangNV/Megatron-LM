@@ -861,7 +861,10 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         if self.config.moe_use_device_initiated_grouped_gemm:
-            tokens_per_expert = tokens_per_expert.long().cuda()
+            if not(tokens_per_expert.is_cuda or tokens_per_expert.is_pinned()):
+                tokens_per_expert = tokens_per_expert.long().cuda()
+            else:
+                tokens_per_expert = tokens_per_expert.long()
         else:
             tokens_per_expert = tokens_per_expert.long().cpu().tolist()
         
@@ -896,7 +899,7 @@ class TEGroupedMLP(MegatronModule):
             )
         with get_fine_grained_offloading_context(self.offload_expert_fc1):
             fc1_output, bias_parallel = self.linear_fc1(
-                permuted_local_hidden_states, tokens_per_expert
+                permuted_local_hidden_states, tokens_per_expert, is_device_initialized=self.config.moe_use_device_initiated_grouped_gemm
             )
         if self.offload_expert_fc1:
             fc1_output, bias_parallel = fine_grained_offloading_group_commit(
@@ -977,7 +980,7 @@ class TEGroupedMLP(MegatronModule):
             with get_fine_grained_offloading_context(self.offload_moe_act):
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
-        output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
+        output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert, is_device_initialized=self.config.moe_use_device_initiated_grouped_gemm)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         if self.offload_moe_act:
