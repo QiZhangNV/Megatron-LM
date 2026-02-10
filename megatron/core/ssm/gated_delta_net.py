@@ -67,6 +67,36 @@ class GatedDeltaNetSubmodules:
     out_proj: Union[ModuleSpec, type] = IdentityOp
 
 
+class GroupedLinearInProj(nn.Module):
+    """Grouped linear input projection: LayerNorm + 6 independent F.linear calls.
+
+    Replaces the fused LN+GEMM followed by split+contiguous,
+    producing 6 separate contiguous tensors directly (q, k, v, gate, beta, alpha).
+    """
+
+    def __init__(self, hidden_size, qk_dim, v_dim, num_v_heads, eps, dtype, device):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, eps=eps, device=device, dtype=dtype)
+        # 6 independent weight matrices
+        self.W_q = nn.Parameter(torch.empty(qk_dim, hidden_size, device=device, dtype=dtype))
+        self.W_k = nn.Parameter(torch.empty(qk_dim, hidden_size, device=device, dtype=dtype))
+        self.W_v = nn.Parameter(torch.empty(v_dim, hidden_size, device=device, dtype=dtype))
+        self.W_g = nn.Parameter(torch.empty(v_dim, hidden_size, device=device, dtype=dtype))
+        self.W_b = nn.Parameter(torch.empty(num_v_heads, hidden_size, device=device, dtype=dtype))
+        self.W_a = nn.Parameter(torch.empty(num_v_heads, hidden_size, device=device, dtype=dtype))
+
+    def forward(self, x):
+        x_norm = self.norm(x)
+        return (
+            F.linear(x_norm, self.W_q),
+            F.linear(x_norm, self.W_k),
+            F.linear(x_norm, self.W_v),
+            F.linear(x_norm, self.W_g),
+            F.linear(x_norm, self.W_b),
+            F.linear(x_norm, self.W_a),
+        )
+
+
 class GatedDeltaNet(MegatronModule):
     """Gated Delta Net (GDN) layer class
 
@@ -147,18 +177,14 @@ class GatedDeltaNet(MegatronModule):
                 "For FP8, the innermost dimension of the GDN layer "
                 "input projection output tensor must be a multiple of 16."
             )
-        self.in_proj = build_module(
-            submodules.in_proj,
-            self.hidden_size,
-            self.in_proj_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=bias,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name="fc1",
-            tp_group=self.pg_collection.tp,
+        self.in_proj = GroupedLinearInProj(
+            hidden_size=self.hidden_size,
+            qk_dim=self.qk_dim,
+            v_dim=self.v_dim,
+            num_v_heads=self.num_value_heads,
+            eps=self.config.layernorm_epsilon,
+            dtype=self.config.params_dtype,
+            device=torch.cuda.current_device(),
         )
 
         # Conv1d for QKV
@@ -301,97 +327,65 @@ class GatedDeltaNet(MegatronModule):
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
+        q, k, v, gate, beta, alpha = self.in_proj(hidden_states)  # each [S, B, dim]
         nvtx_range_pop(suffix="in_proj")
 
-        # CP All to All: CP to HP
-        qkvzba = tensor_a2a_cp2hp(
-            qkvzba,
-            seq_dim=0,
-            head_dim=-1,
-            cp_group=self.pg_collection.cp,
-            split_sections=[
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-                self.v_dim_local_tp,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
-            ],
-        )
-
-        # Transpose: s b x --> b s x
-        # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
-
-        # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
-        qkv, gate, beta, alpha = torch.split(
-            qkvzba,
-            [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-            ],
-            dim=-1,
-        )
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-        beta = beta.reshape(batch, seq_len, -1)
-        alpha = alpha.reshape(batch, seq_len, -1)
-
-        # Convolution on qkv
-        nvtx_range_push(suffix="conv1d")
-        seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
+        # # CP All to All: CP to HP
+        # qkvzba = tensor_a2a_cp2hp(
+        #     qkvzba,
+        #     seq_dim=0,
+        #     head_dim=-1,
+        #     cp_group=self.pg_collection.cp,
+        #     split_sections=[
+        #         self.qk_dim_local_tp,
+        #         self.qk_dim_local_tp,
+        #         self.v_dim_local_tp,
+        #         self.v_dim_local_tp,
+        #         self.num_value_heads // self.tp_size,
+        #         self.num_value_heads // self.tp_size,
+        #     ],
+        # )
+        # Transpose: s b x --> b s x (if B=1, no actual copy)
+        q, k, v, gate, beta, alpha = [
+            t.transpose(0, 1) for t in (q, k, v, gate, beta, alpha)
         ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
-                dim=0,
-                cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
-            )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+
+        # 3 separate conv1d on q, k, v
+        nvtx_range_push(suffix="conv1d")
+        seq_len = q.shape[1]
+        conv1d_weight = self.conv1d.weight.squeeze(1)  # [conv_dim, w]
+        conv1d_bias = self.conv1d.bias if self.conv_bias else None
+
+        # Split conv weights (and bias) for q, k, v
+        conv_w_q = conv1d_weight[:self.qk_dim_local_tp]
+        conv_w_k = conv1d_weight[self.qk_dim_local_tp:2 * self.qk_dim_local_tp]
+        conv_w_v = conv1d_weight[2 * self.qk_dim_local_tp:]
+        if conv1d_bias is not None:
+            conv_b_q = conv1d_bias[:self.qk_dim_local_tp]
+            conv_b_k = conv1d_bias[self.qk_dim_local_tp:2 * self.qk_dim_local_tp]
+            conv_b_v = conv1d_bias[2 * self.qk_dim_local_tp:]
         else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-            )
+            conv_b_q = conv_b_k = conv_b_v = None
+
+        assert self.activation in ["silu", "swish"]
+        q, _ = causal_conv1d(
+            x=q, weight=conv_w_q, bias=conv_b_q,
+            activation=self.activation, initial_state=None, output_final_state=False,
+        )
+        k, _ = causal_conv1d(
+            x=k, weight=conv_w_k, bias=conv_b_k,
+            activation=self.activation, initial_state=None, output_final_state=False,
+        )
+        v, _ = causal_conv1d(
+            x=v, weight=conv_w_v, bias=conv_b_v,
+            activation=self.activation, initial_state=None, output_final_state=False,
+        )
         nvtx_range_pop(suffix="conv1d")
 
-        # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
+        # Prepare QKV tensors (reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
         query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, batch, seq_len
+            q, k, v, gate, beta, alpha, batch, seq_len
         )
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
 
@@ -452,40 +446,35 @@ class GatedDeltaNet(MegatronModule):
         return y
 
     @jit_fuser
-    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
+    def _prepare_qkv_for_gated_delta_rule(self, q, k, v, gate, beta, alpha, batch, seq_len):
         """
         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
-        Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
+        Accepts 6 separate tensors (from GroupedLinearInProj + conv1d).
+        Fuses reshape, L2 norm, repeat_interleave, and contiguous operations.
         """
-        # Split qkv into query_key and value
-        query_key, value = torch.split(
-            qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-            dim=-1,
-        )
+        # Reshape
+        q = q.reshape(batch, seq_len, -1, self.key_head_dim)
+        k = k.reshape(batch, seq_len, -1, self.key_head_dim)
+        v = v.reshape(batch, seq_len, -1, self.value_head_dim)
+        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+        beta = beta.reshape(batch, seq_len, -1)
+        alpha = alpha.reshape(batch, seq_len, -1)
 
-        # Reshape query_key and value
-        query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
-        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
-
-        # Apply L2 norm to query and key
+        # Apply L2 norm to query and key separately
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
-
-        # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
-        query, key = torch.split(query_key, [split_size, split_size], dim=2)
+            q = l2norm(q)
+            k = l2norm(k)
 
         # Expand query and key if needed (grouped query attention)
         if self.num_value_heads // self.num_key_heads > 1:
             repeat_factor = self.num_value_heads // self.num_key_heads
-            query = query.repeat_interleave(repeat_factor, dim=2)
-            key = key.repeat_interleave(repeat_factor, dim=2)
+            q = q.repeat_interleave(repeat_factor, dim=2)
+            k = k.repeat_interleave(repeat_factor, dim=2)
 
         # Make all tensors contiguous
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
+        query = q.contiguous()
+        key = k.contiguous()
+        value = v.contiguous()
         gate = gate.contiguous()
         beta = beta.contiguous()
         alpha = alpha.contiguous()
@@ -545,27 +534,27 @@ class GatedDeltaNet(MegatronModule):
 
             sharded_state_dict.update(module_sharded_sd)
 
-        # At this point the TP sharding is correctly defined for each tensor, but some of the
-        # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
+        # # At this point the TP sharding is correctly defined for each tensor, but some of the
+        # # tensors must be additionally split into separate parts
+        # in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+        # assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
+        #     in_proj_dim_local_tp,
+        #     sharded_state_dict[f"{prefix}in_proj.weight"],
+        # )
 
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            [
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-                self.v_dim_local_tp,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
-            ],
-            ["query", "key", "value", "z", "beta", "alpha"],
-            0,
-        )
+        # sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+        #     sharded_state_dict[f"{prefix}in_proj.weight"],
+        #     [
+        #         self.qk_dim_local_tp,
+        #         self.qk_dim_local_tp,
+        #         self.v_dim_local_tp,
+        #         self.v_dim_local_tp,
+        #         self.num_value_heads // self.tp_size,
+        #         self.num_value_heads // self.tp_size,
+        #     ],
+        #     ["query", "key", "value", "z", "beta", "alpha"],
+        #     0,
+        # )
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (
