@@ -68,22 +68,39 @@ class GatedDeltaNetSubmodules:
 
 
 class GroupedLinearInProj(nn.Module):
-    """Grouped linear input projection: LayerNorm + 6 independent F.linear calls.
+    """Grouped linear input projection: TENorm (RMSNorm/LayerNorm) + 6 independent F.linear calls.
 
     Replaces the fused LN+GEMM followed by split+contiguous,
     producing 6 separate contiguous tensors directly (q, k, v, gate, beta, alpha).
+
+    Uses TE's optimized norm kernel (supports RMSNorm + zero_centered_gamma)
+    to be mathematically identical to the original TELayerNormColumnParallelLinear.
     """
 
-    def __init__(self, hidden_size, qk_dim, v_dim, num_v_heads, eps, dtype, device):
+    def __init__(self, config, hidden_size, qk_dim, v_dim, num_v_heads):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_size, eps=eps, device=device, dtype=dtype)
-        # 6 independent weight matrices
+        # Use TENorm which auto-selects RMSNorm/LayerNorm from config,
+        # and handles zero_centered_gamma correctly.
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        self.norm = TENorm(
+            config=config,
+            hidden_size=hidden_size,
+            eps=config.layernorm_epsilon,
+        )
+        # 6 independent weight matrices, initialized with config.init_method
+        dtype = config.params_dtype
+        device = torch.cuda.current_device()
+        init_method = config.init_method
         self.W_q = nn.Parameter(torch.empty(qk_dim, hidden_size, device=device, dtype=dtype))
         self.W_k = nn.Parameter(torch.empty(qk_dim, hidden_size, device=device, dtype=dtype))
         self.W_v = nn.Parameter(torch.empty(v_dim, hidden_size, device=device, dtype=dtype))
         self.W_g = nn.Parameter(torch.empty(v_dim, hidden_size, device=device, dtype=dtype))
         self.W_b = nn.Parameter(torch.empty(num_v_heads, hidden_size, device=device, dtype=dtype))
         self.W_a = nn.Parameter(torch.empty(num_v_heads, hidden_size, device=device, dtype=dtype))
+        if config.perform_initialization:
+            for w in (self.W_q, self.W_k, self.W_v, self.W_g, self.W_b, self.W_a):
+                init_method(w)
 
     def forward(self, x):
         x_norm = self.norm(x)
@@ -178,13 +195,11 @@ class GatedDeltaNet(MegatronModule):
                 "input projection output tensor must be a multiple of 16."
             )
         self.in_proj = GroupedLinearInProj(
+            config=self.config,
             hidden_size=self.hidden_size,
             qk_dim=self.qk_dim,
             v_dim=self.v_dim,
             num_v_heads=self.num_value_heads,
-            eps=self.config.layernorm_epsilon,
-            dtype=self.config.params_dtype,
-            device=torch.cuda.current_device(),
         )
 
         # Conv1d for QKV
