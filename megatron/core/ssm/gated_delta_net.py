@@ -35,6 +35,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _undo_attention_load_balancing,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -51,6 +52,7 @@ try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
     from fla.ops.cp import build_cp_context
+
     if os.environ.get("MCORE_GDN_USE_OPT_WRAPPER", "0") == "1":
         try:
             from mcore_gdn_opt.gated_delta_rule import chunk_gated_delta_rule
@@ -281,8 +283,12 @@ class GatedDeltaNet(MegatronModule):
         # the entire GatedDeltaNet compute is wrapped in a normal checkpoint and recomputed
         # in the backward pass.
         self.recompute_gdn = False
+        self.recompute_norm_out = False
+        self.recompute_qkv = False
         if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_gdn = "gdn" in self.config.recompute_modules
+            self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
 
         # Cache for CP context objects consumed by FLA kernels. Rebuilding these per-forward
         # is unsafe under CUDA graph capture because build_cp_context allocates
@@ -502,27 +508,137 @@ class GatedDeltaNet(MegatronModule):
         packed_seq_params,
         chunkwise_cp_context,
     ):
-        """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> gated norm -> out_proj).
+        """Run GDN compute with optional discard-output recompute blocks."""
+        recompute_qkv = self.recompute_qkv and self.training
+        recompute_norm_out = self.recompute_norm_out and self.training
+        recompute_manager = (
+            CheckpointManager() if (recompute_qkv or recompute_norm_out) else None
+        )
 
-        Extracted from ``forward`` so the entire module can be wrapped in a recompute
-        checkpoint when ``recompute_modules`` contains ``"gdn"`` (selective full-module
-        recompute, normal checkpointing).
+        def _qkv_proj_and_prepare(hidden_states):
+            outputs, _ = self._compute_qkv_for_gated_delta_rule(
+                hidden_states,
+                batch,
+                seq_len_post_headwise,
+                cp_size_headwise,
+                cp_group_headwise,
+                cp_size_chunkwise,
+                cp_group_chunkwise,
+                cu_seqlens_q,
+                packed_seq_params,
+                chunkwise_cp_context,
+            )
+            return outputs
 
-        Returns:
-            Tuple of (output, output_bias).
-        """
-        # Input projection
+        if recompute_qkv:
+            qkv_outputs = tensor_parallel.CheckpointWithoutOutput(
+                fp8=(self.config.fp8 or self.config.fp4),
+                ckpt_manager=recompute_manager,
+            ).checkpoint(_qkv_proj_and_prepare, hidden_states)
+            thd_cp_a2a_inv = None
+            if (
+                cp_size_headwise > 1
+                and packed_seq_params is not None
+                and packed_seq_params.qkv_format == 'thd'
+            ):
+                _, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
+                    cu_seqlens_q, cp_size_headwise, seq_len_post_headwise
+                )
+        else:
+            qkv_outputs, thd_cp_a2a_inv = self._compute_qkv_for_gated_delta_rule(
+                hidden_states,
+                batch,
+                seq_len_post_headwise,
+                cp_size_headwise,
+                cp_group_headwise,
+                cp_size_chunkwise,
+                cp_group_chunkwise,
+                cu_seqlens_q,
+                packed_seq_params,
+                chunkwise_cp_context,
+            )
+
+        query, key, value, gate, beta, g = qkv_outputs
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+            cp_context=chunkwise_cp_context,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        def _gated_norm_and_a2a(core_attn_out, gate):
+            nvtx_range_push(suffix="gated_norm")
+            norm_out = self._apply_gated_norm(core_attn_out, gate)
+            nvtx_range_pop(suffix="gated_norm")
+
+            norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
+            norm_out = norm_out.transpose(0, 1).contiguous()
+
+            if cp_size_chunkwise > 1:
+                nvtx_range_push(suffix="contiguous_to_zigzag")
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                    norm_out = contiguous_to_zigzag_chunks(
+                        norm_out,
+                        cp_group=cp_group_chunkwise,
+                        seq_dim=0,
+                        cu_seqlens=cu_seqlens_q,
+                    )
+                else:
+                    norm_out = contiguous_to_zigzag_chunks(
+                        norm_out, cp_group=cp_group_chunkwise, seq_dim=0
+                    )
+                nvtx_range_pop(suffix="contiguous_to_zigzag")
+
+            return self._a2a_hp_to_cp(
+                norm_out,
+                cp_size_headwise,
+                cp_group_headwise,
+                packed_seq_params,
+                thd_cp_a2a_inv,
+            )
+
+        if recompute_norm_out:
+            norm_out = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=recompute_manager
+            ).checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
+        else:
+            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
+
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        if recompute_manager is not None:
+            recompute_manager.discard_all_outputs_and_register_unified_recompute(out)
+
+        return out, out_bias
+
+    def _compute_qkv_for_gated_delta_rule(
+        self,
+        hidden_states,
+        batch,
+        seq_len_post_headwise,
+        cp_size_headwise,
+        cp_group_headwise,
+        cp_size_chunkwise,
+        cp_group_chunkwise,
+        cu_seqlens_q,
+        packed_seq_params,
+        chunkwise_cp_context,
+    ):
+        """Compute the QKV preparation block targeted by ``gdn_qkv`` recompute."""
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
-        # Chunkwise CP expects the contiguous-time chunk layout (rank r holds chunks
-        # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule. Megatron attention CP
-        # feeds us the zigzag attention-load-balanced layout (rank r holds
-        # [r, 2*cp-r-1]), so reshuffle chunks over the CP group with a single
-        # all-to-all — no full-sequence gather required.
-        # TODO: Move CP layout ownership to a model/region-level scheduler so hybrid models can
-        # enter contiguous layout before GDN regions instead of paying module-local conversions.
         if cp_size_chunkwise > 1:
             nvtx_range_push(suffix="zigzag_to_contiguous")
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -530,7 +646,9 @@ class GatedDeltaNet(MegatronModule):
                     qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
                 )
             else:
-                qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
+                qkvzba = zigzag_to_contiguous_chunks(
+                    qkvzba, cp_group_chunkwise, seq_dim=0
+                )
             nvtx_range_pop(suffix="zigzag_to_contiguous")
 
         qkvzba, thd_cp_a2a_inv = self._a2a_cp_to_hp(
@@ -553,16 +671,13 @@ class GatedDeltaNet(MegatronModule):
                 if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
                 else None
             )
-            query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+            outputs = self._fused_streamed_pre_gated_delta_rule(
                 qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
             )
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
         else:
             nvtx_range_push(suffix="pre_gated_delta_rule")
             if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
-                # TODO: If additional gated delta rule backends are added, handle this
-                # SBHD + chunkwise CP + batch>1 case per backend instead of
-                # unconditionally rejecting it.
                 raise ValueError(
                     "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
                     "because the FLA gated delta rule backend requires a single batch dimension "
@@ -573,7 +688,7 @@ class GatedDeltaNet(MegatronModule):
                     "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
                     "chunk-local causal-conv inputs can change later chunk numerics."
                 )
-            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+            outputs = self.pre_gated_delta_rule(
                 qkvzba,
                 batch,
                 seq_len_post_headwise,
@@ -585,58 +700,7 @@ class GatedDeltaNet(MegatronModule):
             )
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-            cp_context=chunkwise_cp_context,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
-
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
-
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
-
-        # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
-        # Restores the Megatron attention-load-balanced layout that downstream
-        # layers and loss computation expect.
-        # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous and
-        # restore zigzag only at SDPA/canonical-layout boundaries.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="contiguous_to_zigzag")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0
-                )
-            nvtx_range_pop(suffix="contiguous_to_zigzag")
-
-        norm_out = self._a2a_hp_to_cp(
-            norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
-        )
-
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        return out, out_bias
+        return outputs, thd_cp_a2a_inv
 
     def pre_gated_delta_rule(
         self,

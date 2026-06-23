@@ -566,7 +566,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn".
+             "shared_experts", "mhc", "gdn", "gdn_norm_out", "gdn_qkv".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -581,8 +581,15 @@ class TransformerConfig(ModelParallelConfig):
     "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
             gated norm, CP all-to-all and out_proj). Requires
             experimental_attention_variant="gated_delta_net".
-    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
+    "gdn_norm_out": recompute only the GatedDeltaNet output norm and HP-to-CP all-to-all as a
+            discard-output checkpoint. Requires experimental_attention_variant="gated_delta_net"
+            and cannot be combined with "gdn".
+    "gdn_qkv": recompute only the GatedDeltaNet QKV projection and preparation block as a
+            discard-output checkpoint. Requires experimental_attention_variant="gated_delta_net"
+            and cannot be combined with "gdn". It may be combined with "gdn_norm_out".
+    "moe_act", "layernorm", "mla_up_proj", "mhc", "gdn_norm_out", and "gdn_qkv" use
+    output-discarding checkpointing. "core_attn", "mlp", "moe", "shared_experts", and "gdn"
+    use normal checkpointing.
     """
 
     ####################
@@ -2028,6 +2035,8 @@ class TransformerConfig(ModelParallelConfig):
                     "shared_experts",
                     "mhc",
                     "gdn",
+                    "gdn_norm_out",
+                    "gdn_qkv",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2054,6 +2063,21 @@ class TransformerConfig(ModelParallelConfig):
                     "gdn in recompute_modules is only supported with "
                     "experimental_attention_variant='gated_delta_net'."
                 )
+
+            for gdn_module in ("gdn_norm_out", "gdn_qkv"):
+                if (
+                    gdn_module in self.recompute_modules
+                    and self.experimental_attention_variant != "gated_delta_net"
+                ):
+                    raise ValueError(
+                        f"{gdn_module} in recompute_modules is only supported with "
+                        "experimental_attention_variant='gated_delta_net'."
+                    )
+                if "gdn" in self.recompute_modules and gdn_module in self.recompute_modules:
+                    raise ValueError(
+                        f"gdn and {gdn_module} in recompute_modules cannot be used together: "
+                        "'gdn' already recomputes the entire GatedDeltaNet module."
+                    )
 
             if "core_attn" in self.recompute_modules:
                 warnings.warn(

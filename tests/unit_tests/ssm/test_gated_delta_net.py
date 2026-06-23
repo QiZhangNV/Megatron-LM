@@ -325,6 +325,63 @@ class TestGatedDeltaNet:
                 msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
             )
 
+    @pytest.mark.parametrize(
+        "recompute_attrs",
+        [
+            ("recompute_norm_out",),
+            ("recompute_qkv",),
+            ("recompute_qkv", "recompute_norm_out"),
+        ],
+    )
+    def test_selective_recompute_gdn_discard_output(self, recompute_attrs):
+        """Discard-output GDN blocks preserve outputs and all gradients."""
+        gdn = self.gdn
+        gdn.train()
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
+        seq_length = 64
+        torch.manual_seed(1234)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        def run(enabled):
+            for attr in recompute_attrs:
+                setattr(gdn, attr, enabled)
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = base_input.clone().detach().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().square().mean().backward()
+            param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().clone(), hidden_states.grad.detach().clone(), param_grads
+
+        try:
+            out_ref, dinput_ref, pgrad_ref = run(enabled=False)
+            out_rc, dinput_rc, pgrad_rc = run(enabled=True)
+        finally:
+            for attr in recompute_attrs:
+                setattr(gdn, attr, False)
+
+        torch.testing.assert_close(out_rc, out_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=1e-4, atol=1e-4)
+        assert pgrad_ref.keys() == pgrad_rc.keys()
+        assert pgrad_ref
+        for name in pgrad_ref:
+            torch.testing.assert_close(
+                pgrad_rc[name],
+                pgrad_ref[name],
+                rtol=1e-4,
+                atol=1e-4,
+                msg=lambda message, param_name=name: (
+                    f"gradient mismatch for parameter '{param_name}': {message}"
+                ),
+            )
+
     def test_gpu_forward_rejects_sbhd_chunkwise_cp_batch_gt_one(self):
         if not (self.linear_cp_mode == "chunkwise" and self.cp_size > 1):
             pytest.skip("Only chunkwise CP with CP>1 uses the FLA CP batch guard.")
