@@ -185,16 +185,17 @@ class MultimodalModel(MegatronModule):
         else:
             decoder_input = text_embeddings
 
-        (decoder_input, input_ids, labels, loss_mask, attention_mask, position_ids) = (
-            self._cp_split_for_forward(
-                decoder_input=decoder_input,
-                input_ids=input_ids,
-                labels=labels,
-                loss_mask=loss_mask,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-            )
+        (
+            decoder_input, input_ids, labels, loss_mask,
+            attention_mask, position_ids, padding_mask,
+        ) = self._cp_split_for_forward(
+            decoder_input=decoder_input,
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
         )
 
         with self._thd_mrope_no_cp_override(packed_seq_params):
@@ -205,6 +206,7 @@ class MultimodalModel(MegatronModule):
                 decoder_input=decoder_input,
                 labels=labels,
                 loss_mask=loss_mask,
+                padding_mask=padding_mask,
                 packed_seq_params=packed_seq_params,
             )
 
