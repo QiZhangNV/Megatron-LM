@@ -32,9 +32,14 @@ def _cp_split_tensor(tensor, seq_dim, cp_size, cp_rank):
     This mirrors ``megatron.core.utils.get_batch_on_this_cp_rank``.
     """
     S = tensor.shape[seq_dim]
-    assert S % (2 * cp_size) == 0, f"seq_len {S} not divisible by 2*cp_size={2 * cp_size}"
+    assert S % (2 * cp_size) == 0, (
+        f"seq_len {S} not divisible by 2*cp_size={2 * cp_size}"
+    )
     tensor = tensor.view(
-        *tensor.shape[:seq_dim], 2 * cp_size, S // (2 * cp_size), *tensor.shape[seq_dim + 1 :]
+        *tensor.shape[:seq_dim],
+        2 * cp_size,
+        S // (2 * cp_size),
+        *tensor.shape[seq_dim + 1 :],
     )
     index = torch.zeros(2, dtype=torch.int64, device=tensor.device)
     index[0] = cp_rank
@@ -75,7 +80,9 @@ def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
     """
     from transformer_engine.pytorch import cpp_extensions as tex
 
-    idx = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
+    idx = tex.thd_get_partitioned_indices(
+        cu_seqlens_padded, total_tokens, cp_size, cp_rank
+    )
     return idx.long()
 
 
@@ -169,6 +176,7 @@ class MultimodalModel(MegatronModule):
         loss_mask: Tensor = None,
         pixel_values: Tensor = None,
         image_grid_thw: Tensor = None,
+        vision_grid_metadata=None,
         packed_seq_params=None,
         **kwargs,
     ):
@@ -190,9 +198,18 @@ class MultimodalModel(MegatronModule):
 
         vision_embeddings = None
         if self.vision_model is not None and pixel_values is not None:
-            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+            if vision_grid_metadata is None:
+                vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+            else:
+                vision_embeddings = self.vision_model(
+                    pixel_values,
+                    image_grid_thw,
+                    grid_metadata=vision_grid_metadata,
+                )
 
-        text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
+        text_embeddings = self.language_model.embedding(
+            input_ids=input_ids, position_ids=None
+        )
         if vision_embeddings is not None:
             decoder_input = self._scatter_vision_embeddings(
                 input_ids, text_embeddings, vision_embeddings
@@ -201,8 +218,13 @@ class MultimodalModel(MegatronModule):
             decoder_input = text_embeddings
 
         (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         ) = self._cp_split_for_forward(
             decoder_input=decoder_input,
             input_ids=input_ids,
@@ -262,7 +284,10 @@ class MultimodalModel(MegatronModule):
         return combined
 
     def compute_position_ids(
-        self, input_ids: Tensor, image_grid_thw: Optional[Tensor] = None, packed_seq_params=None
+        self,
+        input_ids: Tensor,
+        image_grid_thw: Optional[Tensor] = None,
+        packed_seq_params=None,
     ) -> Tensor:
         """Compute position IDs.  Override for MRoPE etc.
 
@@ -297,14 +322,21 @@ class MultimodalModel(MegatronModule):
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
             return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
 
         if packed_seq_params is not None:
             total_tokens = (
-                decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
+                decoder_input.shape[0]
+                if decoder_input is not None
+                else input_ids.shape[1]
             )
             idx = _thd_cp_partition_index(
                 packed_seq_params.cu_seqlens_q_padded, total_tokens, cp_size, cp_rank
@@ -325,7 +357,9 @@ class MultimodalModel(MegatronModule):
                 return (
                     None
                     if t is None
-                    else _cp_split_tensor(t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
+                    else _cp_split_tensor(
+                        t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank
+                    )
                 )
 
             decoder_input = _split(decoder_input, 0)
@@ -336,8 +370,13 @@ class MultimodalModel(MegatronModule):
             padding_mask = _split(padding_mask, 1)
 
         return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         )
 
     @staticmethod
@@ -355,7 +394,10 @@ class MultimodalModel(MegatronModule):
         cp_rank = parallel_state.get_context_parallel_rank()
         if packed_seq_params is not None:
             idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, loss_mask.shape[1], cp_size, cp_rank
+                packed_seq_params.cu_seqlens_q_padded,
+                loss_mask.shape[1],
+                cp_size,
+                cp_rank,
             )
             return loss_mask.index_select(1, idx)
         return _cp_split_tensor(loss_mask, seq_dim=1, cp_size=cp_size, cp_rank=cp_rank)
@@ -394,6 +436,7 @@ class MultimodalModel(MegatronModule):
         padding_mask: Tensor = None,
         pixel_values: Tensor = None,
         image_grid_thw: Tensor = None,
+        vision_grid_metadata=None,
         decoder_input: Tensor = None,
         packed_seq_params=None,
         **kwargs,
@@ -414,6 +457,8 @@ class MultimodalModel(MegatronModule):
                 ``loss_mask``: only true padding, not SFT prompt tokens.
             pixel_values: Preprocessed image pixels.
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
+            vision_grid_metadata: Optional precomputed, graph-safe grid
+                metadata for the vision encoder.
             decoder_input: Pre-computed decoder input (skip embed).
             packed_seq_params: ``PackedSeqParams`` for THD attention.
 
@@ -429,10 +474,19 @@ class MultimodalModel(MegatronModule):
 
         vision_embeddings = None
         if self.vision_model is not None and pixel_values is not None:
-            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+            if vision_grid_metadata is None:
+                vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+            else:
+                vision_embeddings = self.vision_model(
+                    pixel_values,
+                    image_grid_thw,
+                    grid_metadata=vision_grid_metadata,
+                )
 
         if decoder_input is None and self.language_model is not None:
-            text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
+            text_embeddings = self.language_model.embedding(
+                input_ids=input_ids, position_ids=None
+            )
 
             if vision_embeddings is not None:
                 decoder_input = self._scatter_vision_embeddings(
@@ -442,8 +496,13 @@ class MultimodalModel(MegatronModule):
                 decoder_input = text_embeddings
 
         (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         ) = self._cp_split_for_forward(
             decoder_input=decoder_input,
             input_ids=input_ids,

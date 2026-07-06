@@ -20,7 +20,7 @@ Key design choices:
     processor) so the merger's simple reshape is correct.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -40,9 +40,110 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+
+VisionGridMetadata = Dict[str, Union[Tensor, int]]
+
+
+def build_vision_grid_metadata(
+    grid_thw: Tensor,
+    spatial_merge_size: int,
+    num_grid_per_side: int,
+) -> VisionGridMetadata:
+    """Build shape metadata consumed by the vision encoder.
+
+    This helper is intentionally host-side. It converts dynamic image-grid
+    structure into fixed-shape tensors before CUDA graph capture, while the
+    learned position lookup and every trainable vision operation remain in the
+    encoder forward graph.
+    """
+    grid_thw_list = [tuple(int(value) for value in row) for row in grid_thw.tolist()]
+    merge = spatial_merge_size
+    n = num_grid_per_side
+
+    pos_embed_indices = []
+    pos_embed_weights = []
+    rotary_pos_ids = []
+    cu_seqlens = [0]
+    max_seqlen = 0
+
+    for num_frames, height, width in grid_thw_list:
+        if height % merge != 0 or width % merge != 0:
+            raise ValueError(
+                f"vision grid ({height}, {width}) must be divisible by merge size {merge}"
+            )
+
+        h_idxs = torch.linspace(0, n - 1, height)
+        w_idxs = torch.linspace(0, n - 1, width)
+        h_floor = h_idxs.int()
+        w_floor = w_idxs.int()
+        h_ceil = (h_floor + 1).clip(max=n - 1)
+        w_ceil = (w_floor + 1).clip(max=n - 1)
+        dh = h_idxs - h_floor.float()
+        dw = w_idxs - w_floor.float()
+
+        base_h = h_floor * n
+        base_h_ceil = h_ceil * n
+        indices = torch.stack(
+            (
+                (base_h[:, None] + w_floor[None, :]).flatten(),
+                (base_h[:, None] + w_ceil[None, :]).flatten(),
+                (base_h_ceil[:, None] + w_floor[None, :]).flatten(),
+                (base_h_ceil[:, None] + w_ceil[None, :]).flatten(),
+            )
+        )
+        weights = torch.stack(
+            (
+                ((1 - dh)[:, None] * (1 - dw)[None, :]).flatten(),
+                ((1 - dh)[:, None] * dw[None, :]).flatten(),
+                (dh[:, None] * (1 - dw)[None, :]).flatten(),
+                (dh[:, None] * dw[None, :]).flatten(),
+            )
+        )
+
+        merged_h = height // merge
+        merged_w = width // merge
+
+        def _to_block_merge_order(tensor: Tensor) -> Tensor:
+            tensor = tensor[:, None, :].expand(-1, num_frames, -1)
+            tensor = tensor.reshape(4, num_frames, merged_h, merge, merged_w, merge)
+            return tensor.permute(0, 1, 2, 4, 3, 5).reshape(4, -1).contiguous()
+
+        pos_embed_indices.append(_to_block_merge_order(indices))
+        pos_embed_weights.append(_to_block_merge_order(weights))
+
+        block_rows = torch.arange(merged_h)
+        block_cols = torch.arange(merged_w)
+        intra_row = torch.arange(merge)
+        intra_col = torch.arange(merge)
+        row_idx = (
+            block_rows[:, None, None, None] * merge + intra_row[None, None, :, None]
+        )
+        col_idx = (
+            block_cols[None, :, None, None] * merge + intra_col[None, None, None, :]
+        )
+        row_idx = row_idx.expand(merged_h, merged_w, merge, merge).reshape(-1)
+        col_idx = col_idx.expand(merged_h, merged_w, merge, merge).reshape(-1)
+        coords = torch.stack((row_idx, col_idx), dim=-1).repeat(num_frames, 1)
+        rotary_pos_ids.append(coords)
+
+        frame_seqlen = height * width
+        max_seqlen = max(max_seqlen, frame_seqlen)
+        for _ in range(num_frames):
+            cu_seqlens.append(cu_seqlens[-1] + frame_seqlen)
+
+    return {
+        "pos_embed_indices": torch.cat(pos_embed_indices, dim=1).long(),
+        "pos_embed_weights": torch.cat(pos_embed_weights, dim=1).float(),
+        "rotary_pos_ids": torch.cat(rotary_pos_ids, dim=0).long(),
+        "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
+        "max_seqlen": max_seqlen,
+    }
+
+
 # -------------------------------------------------------------------
 # PatchEmbed — Conv3d (replicated, no TP sharding)
 # -------------------------------------------------------------------
+
 
 class Qwen35VLPatchEmbed(MegatronModule):
     """3D convolution patch embedding matching HF ``Qwen3VLVisionPatchEmbed``.
@@ -100,14 +201,13 @@ class Qwen35VLPatchEmbed(MegatronModule):
             self.patch_size,
             self.patch_size,
         )
-        return self.proj(pixel_values.to(dtype=target_dtype)).view(
-            -1, self.hidden_size
-        )
+        return self.proj(pixel_values.to(dtype=target_dtype)).view(-1, self.hidden_size)
 
 
 # -------------------------------------------------------------------
 # VisionRotaryEmbedding — 1D frequency table
 # -------------------------------------------------------------------
+
 
 class Qwen35VLVisionRotaryEmbedding(MegatronModule):
     """1D rotary position frequency table for the vision transformer.
@@ -131,10 +231,7 @@ class Qwen35VLVisionRotaryEmbedding(MegatronModule):
         super().__init__(config=config)
         self.dim = dim
         self.theta = theta
-        inv_freq = 1.0 / (
-            theta
-            ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _get_inv_freq(self, device: torch.device) -> Tensor:
@@ -149,8 +246,11 @@ class Qwen35VLVisionRotaryEmbedding(MegatronModule):
             self.theta
             ** (
                 torch.arange(
-                    0, self.dim, 2,
-                    dtype=torch.float32, device=device,
+                    0,
+                    self.dim,
+                    2,
+                    dtype=torch.float32,
+                    device=device,
                 )
                 / self.dim
             )
@@ -174,9 +274,7 @@ class Qwen35VLVisionRotaryEmbedding(MegatronModule):
             if self.inv_freq.device.type != "meta":
                 device = self.inv_freq.device
             else:
-                device = torch.device(
-                    "cuda", torch.cuda.current_device()
-                )
+                device = torch.device("cuda", torch.cuda.current_device())
         inv_freq = self._get_inv_freq(device)
         seq = torch.arange(seqlen, device=device, dtype=inv_freq.dtype)
         return torch.outer(seq, inv_freq)
@@ -185,6 +283,7 @@ class Qwen35VLVisionRotaryEmbedding(MegatronModule):
 # -------------------------------------------------------------------
 # PatchMerger — per-token LN, spatial merge, TP-sharded MLP
 # -------------------------------------------------------------------
+
 
 class Qwen35VLPatchMerger(MegatronModule):
     """Spatial patch merger matching HF ``Qwen3VLVisionPatchMerger``.
@@ -212,7 +311,7 @@ class Qwen35VLPatchMerger(MegatronModule):
     ):
         super().__init__(config=config)
         self.spatial_merge_size = spatial_merge_size
-        self.merge_dim = hidden_size * (spatial_merge_size ** 2)
+        self.merge_dim = hidden_size * (spatial_merge_size**2)
         merge_dim = self.merge_dim
 
         self.patch_norm = TENorm(config=config, hidden_size=hidden_size, eps=1e-6)
@@ -258,6 +357,7 @@ class Qwen35VLPatchMerger(MegatronModule):
 # -------------------------------------------------------------------
 # Qwen35VLVisionEncoder — top-level encoder module
 # -------------------------------------------------------------------
+
 
 class Qwen35VLVisionEncoder(VisionModule):
     """Megatron-native Qwen3.5-VL vision encoder.
@@ -310,14 +410,16 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         # --- Learned position embedding with bilinear interpolation ---
         self.pos_embed = torch.nn.Embedding(
-            max_num_positions, config.hidden_size,
+            max_num_positions,
+            config.hidden_size,
         )
-        self.num_grid_per_side = int(max_num_positions ** 0.5)
+        self.num_grid_per_side = int(max_num_positions**0.5)
 
         # --- Vision rotary embeddings ---
         head_dim = config.hidden_size // config.num_attention_heads
         self.rot_pos_emb = Qwen35VLVisionRotaryEmbedding(
-            head_dim // 2, config=config,
+            head_dim // 2,
+            config=config,
         )
 
         # --- Transformer blocks ---
@@ -325,6 +427,7 @@ class Qwen35VLVisionEncoder(VisionModule):
             from examples.multimodal_dev.models.qwen35_vl.specs import (
                 get_qwen35_vl_vision_spec,
             )
+
             transformer_layer_spec = get_qwen35_vl_vision_spec()
 
         self.decoder = TransformerBlock(
@@ -348,7 +451,9 @@ class Qwen35VLVisionEncoder(VisionModule):
     # ---------------------------------------------------------------
 
     def _fast_pos_embed_interpolate(
-        self, grid_thw: Tensor,
+        self,
+        grid_thw: Tensor,
+        grid_metadata: Optional[VisionGridMetadata] = None,
     ) -> Tensor:
         """Bilinear interpolation of the learned 2D position table.
 
@@ -361,6 +466,14 @@ class Qwen35VLVisionEncoder(VisionModule):
             ``[total_patches, hidden_size]`` position embeddings in
             block-merge order.
         """
+        if grid_metadata is not None:
+            idx_tensor = grid_metadata["pos_embed_indices"]
+            weight_tensor = grid_metadata["pos_embed_weights"].to(
+                dtype=self.pos_embed.weight.dtype
+            )
+            pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+            return pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
         grid_thw_list = grid_thw.tolist()
         grid_ts = [int(row[0]) for row in grid_thw_list]
         grid_hs = [int(row[1]) for row in grid_thw_list]
@@ -405,21 +518,17 @@ class Qwen35VLVisionEncoder(VisionModule):
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = torch.tensor(
-            idx_list, dtype=torch.long, device=device,
+            idx_list,
+            dtype=torch.long,
+            device=device,
         )
         weight_tensor = torch.tensor(
             weight_list,
             dtype=self.pos_embed.weight.dtype,
             device=device,
         )
-        pos_embeds = (
-            self.pos_embed(idx_tensor).to(device)
-            * weight_tensor[:, :, None]
-        )
-        patch_pos_embeds = (
-            pos_embeds[0] + pos_embeds[1]
-            + pos_embeds[2] + pos_embeds[3]
-        )
+        pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
         patch_pos_embeds = patch_pos_embeds.split(
             [h * w for h, w in zip(grid_hs, grid_ws)]
@@ -428,12 +537,20 @@ class Qwen35VLVisionEncoder(VisionModule):
         merge = self.spatial_merge_size
         result = []
         for pe, t, h, w in zip(
-            patch_pos_embeds, grid_ts, grid_hs, grid_ws,
+            patch_pos_embeds,
+            grid_ts,
+            grid_hs,
+            grid_ws,
         ):
             pe = pe.repeat(t, 1)
             pe = (
                 pe.view(
-                    t, h // merge, merge, w // merge, merge, -1,
+                    t,
+                    h // merge,
+                    merge,
+                    w // merge,
+                    merge,
+                    -1,
                 )
                 .permute(0, 1, 3, 2, 4, 5)
                 .flatten(0, 4)
@@ -446,7 +563,11 @@ class Qwen35VLVisionEncoder(VisionModule):
     # 2D Vision RoPE
     # ---------------------------------------------------------------
 
-    def _compute_rotary_pos_emb(self, grid_thw: Tensor) -> Tensor:
+    def _compute_rotary_pos_emb(
+        self,
+        grid_thw: Tensor,
+        grid_metadata: Optional[VisionGridMetadata] = None,
+    ) -> Tensor:
         """Compute 2D Vision RoPE for all patches in block-merge order.
 
         Matches HF ``Qwen3VLVisionModel.rot_pos_emb``.
@@ -459,20 +580,53 @@ class Qwen35VLVisionEncoder(VisionModule):
             when ``config.mrope_section`` is set.  Otherwise returns the legacy
             ``[total_patches, head_dim // 2]`` row/column frequency tensor.
         """
+        if grid_metadata is not None:
+            pos_ids = grid_metadata["rotary_pos_ids"]
+            freq_table = self.rot_pos_emb(
+                self.num_grid_per_side,
+                device=pos_ids.device,
+            )
+            embeddings = freq_table[pos_ids].flatten(1)
+
+            mrope_section = getattr(self.config, "mrope_section", None)
+            if mrope_section is None:
+                return embeddings
+
+            sec_t, sec_h, sec_w = (int(section) for section in mrope_section)
+            if sec_t != 0 or sec_h + sec_w != embeddings.shape[-1]:
+                raise ValueError(
+                    "Qwen3.5-VL vision RoPE expects mrope_section "
+                    f"[0, row_dim, col_dim] summing to {embeddings.shape[-1]}, "
+                    f"got {mrope_section}"
+                )
+
+            raw_freqs = embeddings.new_zeros(
+                3,
+                1,
+                embeddings.shape[0],
+                embeddings.shape[1],
+            )
+            raw_freqs[1, 0, :, :sec_h] = embeddings[:, :sec_h]
+            raw_freqs[2, 0, :, sec_h : sec_h + sec_w] = embeddings[
+                :, sec_h : sec_h + sec_w
+            ]
+            return raw_freqs
+
         merge = self.spatial_merge_size
         grid_thw_list = grid_thw.tolist()
 
         max_hw = max(max(int(h), int(w)) for _, h, w in grid_thw_list)
         freq_table = self.rot_pos_emb(
-            max_hw, device=grid_thw.device,
+            max_hw,
+            device=grid_thw.device,
         )
         device = freq_table.device
 
-        total_tokens = sum(
-            int(t) * int(h) * int(w) for t, h, w in grid_thw_list
-        )
+        total_tokens = sum(int(t) * int(h) * int(w) for t, h, w in grid_thw_list)
         pos_ids = torch.empty(
-            (total_tokens, 2), dtype=torch.long, device=device,
+            (total_tokens, 2),
+            dtype=torch.long,
+            device=device,
         )
 
         offset = 0
@@ -489,19 +643,23 @@ class Qwen35VLVisionEncoder(VisionModule):
             intra_col = torch.arange(merge, device=device)
 
             row_idx = (
-                block_rows[:, None, None, None] * merge
-                + intra_row[None, None, :, None]
+                block_rows[:, None, None, None] * merge + intra_row[None, None, :, None]
             )
             col_idx = (
-                block_cols[None, :, None, None] * merge
-                + intra_col[None, None, None, :]
+                block_cols[None, :, None, None] * merge + intra_col[None, None, None, :]
             )
 
             row_idx = row_idx.expand(
-                merged_h, merged_w, merge, merge,
+                merged_h,
+                merged_w,
+                merge,
+                merge,
             ).reshape(-1)
             col_idx = col_idx.expand(
-                merged_h, merged_w, merge, merge,
+                merged_h,
+                merged_w,
+                merge,
+                merge,
             ).reshape(-1)
 
             coords = torch.stack((row_idx, col_idx), dim=-1)
@@ -509,7 +667,7 @@ class Qwen35VLVisionEncoder(VisionModule):
                 coords = coords.repeat(num_frames, 1)
 
             n_tokens = coords.shape[0]
-            pos_ids[offset: offset + n_tokens] = coords
+            pos_ids[offset : offset + n_tokens] = coords
             offset += n_tokens
 
         embeddings = freq_table[pos_ids]
@@ -528,12 +686,13 @@ class Qwen35VLVisionEncoder(VisionModule):
             )
 
         raw_freqs = embeddings.new_zeros(
-            3, 1, embeddings.shape[0], embeddings.shape[1],
+            3,
+            1,
+            embeddings.shape[0],
+            embeddings.shape[1],
         )
         raw_freqs[1, 0, :, :sec_h] = embeddings[:, :sec_h]
-        raw_freqs[2, 0, :, sec_h : sec_h + sec_w] = embeddings[
-            :, sec_h : sec_h + sec_w
-        ]
+        raw_freqs[2, 0, :, sec_h : sec_h + sec_w] = embeddings[:, sec_h : sec_h + sec_w]
         return raw_freqs
 
     # ---------------------------------------------------------------
@@ -541,7 +700,10 @@ class Qwen35VLVisionEncoder(VisionModule):
     # ---------------------------------------------------------------
 
     @staticmethod
-    def _build_packed_seq_params(grid_thw: Tensor) -> PackedSeqParams:
+    def _build_packed_seq_params(
+        grid_thw: Tensor,
+        grid_metadata: Optional[VisionGridMetadata] = None,
+    ) -> PackedSeqParams:
         """Build ``PackedSeqParams`` from grid dimensions.
 
         Each temporal frame of each image forms a separate sub-sequence
@@ -553,13 +715,16 @@ class Qwen35VLVisionEncoder(VisionModule):
         Returns:
             ``PackedSeqParams`` for ``TransformerBlock``.
         """
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0],
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        max_seqlen = int(
-            (grid_thw[:, 1] * grid_thw[:, 2]).max().item()
-        )
+        if grid_metadata is not None:
+            cu_seqlens = grid_metadata["cu_seqlens"]
+            max_seqlen = grid_metadata["max_seqlen"]
+        else:
+            cu_seqlens = torch.repeat_interleave(
+                grid_thw[:, 1] * grid_thw[:, 2],
+                grid_thw[:, 0],
+            ).cumsum(dim=0, dtype=torch.int32)
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+            max_seqlen = int((grid_thw[:, 1] * grid_thw[:, 2]).max().item())
 
         return PackedSeqParams(
             qkv_format="thd",
@@ -577,6 +742,7 @@ class Qwen35VLVisionEncoder(VisionModule):
         self,
         pixel_values: Tensor,
         grid_thw: Tensor,
+        grid_metadata: Optional[VisionGridMetadata] = None,
     ) -> Tensor:
         """Encode images / video frames.
 
@@ -592,17 +758,17 @@ class Qwen35VLVisionEncoder(VisionModule):
         hidden_states = self.patch_embed(pixel_values)
 
         # 2. Learned position embedding (bilinear interpolation)
-        pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
+        pos_embeds = self._fast_pos_embed_interpolate(grid_thw, grid_metadata)
         hidden_states = hidden_states + pos_embeds
 
         # 3. 2D Vision RoPE
-        rot_freqs = self._compute_rotary_pos_emb(grid_thw)
+        rot_freqs = self._compute_rotary_pos_emb(grid_thw, grid_metadata)
         if getattr(self.config, "mrope_section", None) is None:
             emb = torch.cat((rot_freqs, rot_freqs), dim=-1)
             rot_freqs = emb.unsqueeze(1).unsqueeze(1)
 
         # 4. Transformer blocks with PackedSeqParams
-        packed_seq_params = self._build_packed_seq_params(grid_thw)
+        packed_seq_params = self._build_packed_seq_params(grid_thw, grid_metadata)
         hidden_states = hidden_states.unsqueeze(1)
         hidden_states = self.decoder(
             hidden_states=hidden_states,

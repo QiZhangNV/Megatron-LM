@@ -14,8 +14,12 @@ from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VIDEO_TOKEN_ID,
     QWEN35_VL_VISION_START_TOKEN_ID,
+    VISION_KWARGS,
 )
 from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
+from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
+    build_vision_grid_metadata,
+)
 
 
 class MockQwen35VLDataset(Dataset):
@@ -64,6 +68,11 @@ class MockQwen35VLDataset(Dataset):
         w_patches = image_size // patch_size
         t_patches = temporal_patch_size
         self.grid_thw = torch.tensor([[t_patches, h_patches, w_patches]])
+        self.vision_grid_metadata = build_vision_grid_metadata(
+            self.grid_thw,
+            spatial_merge_size=spatial_merge_size,
+            num_grid_per_side=int(VISION_KWARGS["max_num_positions"] ** 0.5),
+        )
 
         self.num_merged_tokens = (
             t_patches
@@ -71,7 +80,8 @@ class MockQwen35VLDataset(Dataset):
             * (w_patches // spatial_merge_size)
         )
         self.image_seq_length = min(
-            image_seq_length, self.num_merged_tokens,
+            image_seq_length,
+            self.num_merged_tokens,
         )
         self.total_patches = t_patches * h_patches * w_patches
 
@@ -82,7 +92,10 @@ class MockQwen35VLDataset(Dataset):
         # Reserve 1 slot for the vision_start sentinel before image tokens.
         text_length = self.seq_length - self.image_seq_length - 1
         text_tokens = torch.randint(
-            1, self.vocab_size, (text_length,), dtype=torch.long,
+            1,
+            self.vocab_size,
+            (text_length,),
+            dtype=torch.long,
         )
         special_ids = {
             self.image_token_id,
@@ -94,18 +107,21 @@ class MockQwen35VLDataset(Dataset):
 
         prefix_len = text_length // 2
         suffix_len = text_length - prefix_len
-        input_ids = torch.cat([
-            text_tokens[:prefix_len],
-            torch.tensor(
-                [self.vision_start_token_id], dtype=torch.long,
-            ),
-            torch.full(
-                (self.image_seq_length,),
-                self.image_token_id,
-                dtype=torch.long,
-            ),
-            text_tokens[prefix_len: prefix_len + suffix_len],
-        ])
+        input_ids = torch.cat(
+            [
+                text_tokens[:prefix_len],
+                torch.tensor(
+                    [self.vision_start_token_id],
+                    dtype=torch.long,
+                ),
+                torch.full(
+                    (self.image_seq_length,),
+                    self.image_token_id,
+                    dtype=torch.long,
+                ),
+                text_tokens[prefix_len : prefix_len + suffix_len],
+            ]
+        )
 
         labels = input_ids.clone()
         labels[:-1] = input_ids[1:]
@@ -114,12 +130,7 @@ class MockQwen35VLDataset(Dataset):
         loss_mask = (input_ids != self.image_token_id).float()
         loss_mask[-1] = 0
 
-        pixel_dim = (
-            3
-            * self.temporal_patch_size
-            * self.patch_size
-            * self.patch_size
-        )
+        pixel_dim = 3 * self.temporal_patch_size * self.patch_size * self.patch_size
         pixel_values = torch.randn(self.total_patches, pixel_dim)
 
         image_grid_thw = self.grid_thw.clone()
@@ -140,12 +151,24 @@ class MockQwen35VLDataset(Dataset):
             "loss_mask": loss_mask,
             "cu_seqlens": torch.tensor([0, self.seq_length], dtype=torch.int32),
             "cu_seqlens_padded": torch.tensor(
-                [0, self.seq_length], dtype=torch.int32,
+                [0, self.seq_length],
+                dtype=torch.int32,
             ),
             "max_seqlen": torch.tensor(self.seq_length, dtype=torch.int32),
             "position_ids": position_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
+            "vision_pos_embed_indices": self.vision_grid_metadata[
+                "pos_embed_indices"
+            ].clone(),
+            "vision_pos_embed_weights": self.vision_grid_metadata[
+                "pos_embed_weights"
+            ].clone(),
+            "vision_rotary_pos_ids": self.vision_grid_metadata[
+                "rotary_pos_ids"
+            ].clone(),
+            "vision_cu_seqlens": self.vision_grid_metadata["cu_seqlens"].clone(),
+            "vision_max_seqlen": self.vision_grid_metadata["max_seqlen"],
         }
 
 
@@ -180,13 +203,16 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     )
 
     train_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[0], **kwargs,
+        num_samples=train_val_test_num_samples[0],
+        **kwargs,
     )
     val_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[1], **kwargs,
+        num_samples=train_val_test_num_samples[1],
+        **kwargs,
     )
     test_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[2], **kwargs,
+        num_samples=train_val_test_num_samples[2],
+        **kwargs,
     )
 
     return train_ds, val_ds, test_ds

@@ -34,9 +34,10 @@ def _use_text_only_proxy_bypass(args) -> bool:
         return True
 
     # Retain the original full-CG-only escape hatch for existing recipes.
-    return _is_full_iteration_cuda_graph(args) and os.getenv(
-        "MCORE_QWEN35_VL_FULLCG_TEXT_ONLY", "0"
-    ) == "1"
+    return (
+        _is_full_iteration_cuda_graph(args)
+        and os.getenv("MCORE_QWEN35_VL_FULLCG_TEXT_ONLY", "0") == "1"
+    )
 
 
 # -------------------------------------------------------------------
@@ -70,7 +71,9 @@ def _id_to_dtype(id_val):
 def _broadcast_tensor(tensor, src, group, device):
     """Broadcast a single tensor from *src* to all ranks in *group*."""
     ndim = torch.tensor(
-        [len(tensor.shape) if tensor is not None else 0], dtype=torch.long, device=device
+        [len(tensor.shape) if tensor is not None else 0],
+        dtype=torch.long,
+        device=device,
     )
     torch.distributed.broadcast(ndim, src, group=group)
 
@@ -79,7 +82,9 @@ def _broadcast_tensor(tensor, src, group, device):
 
     if tensor is not None:
         shape_tensor = torch.tensor(list(tensor.shape), dtype=torch.long, device=device)
-        dtype_id = torch.tensor([_dtype_to_id(tensor.dtype)], dtype=torch.long, device=device)
+        dtype_id = torch.tensor(
+            [_dtype_to_id(tensor.dtype)], dtype=torch.long, device=device
+        )
     else:
         shape_tensor = torch.zeros(ndim.item(), dtype=torch.long, device=device)
         dtype_id = torch.zeros(1, dtype=torch.long, device=device)
@@ -103,14 +108,17 @@ def _broadcast_tensor(tensor, src, group, device):
 
 def broadcast_data_batch(data, device="cuda"):
     """Broadcast a data-batch dict from TP rank 0 to all TP ranks."""
-    if (
-        mpu.get_tensor_model_parallel_world_size() == 1
-        and _is_full_iteration_cuda_graph(get_args())
-    ):
-        # FullCudaGraphWrapper has already copied the raw batch into static CUDA
-        # buffers. Avoid the dynamic key/shape protocol, which performs host
-        # synchronizations that cannot be captured.
-        return data if data is not None else {}
+    if mpu.get_tensor_model_parallel_world_size() == 1:
+        if data is None:
+            return {}
+        if _is_full_iteration_cuda_graph(get_args()):
+            # FullCudaGraphWrapper has already copied the raw batch into static
+            # CUDA buffers.
+            return data
+        return {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in data.items()
+        }
 
     src = get_tensor_model_parallel_src_rank()
     group = get_tensor_model_parallel_group()
@@ -157,7 +165,9 @@ def broadcast_data_batch(data, device="cuda"):
 # -------------------------------------------------------------------
 
 
-def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) -> PackedSeqParams:
+def _build_packed_seq_params(
+    seq_lengths: torch.Tensor, device: torch.device
+) -> PackedSeqParams:
     """Build ``PackedSeqParams`` from per-sample valid sequence lengths.
 
     Args:
@@ -173,7 +183,9 @@ def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) ->
     cu_seqlens = torch.zeros(lengths_t.numel() + 1, dtype=torch.int32, device=device)
     torch.cumsum(lengths_t, dim=0, out=cu_seqlens[1:])
     max_seqlen = int(lengths_t.max().item())
-    return _build_packed_seq_params_from_cu_seqlens(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    return _build_packed_seq_params_from_cu_seqlens(
+        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+    )
 
 
 def _build_packed_seq_params_from_cu_seqlens(
@@ -192,9 +204,60 @@ def _build_packed_seq_params_from_cu_seqlens(
         cu_seqlens_kv_padded=cs,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
-        qkv_format='thd',
+        qkv_format="thd",
         total_tokens=total_tokens,
     )
+
+
+_VISION_GRID_METADATA_FIELDS = (
+    "vision_pos_embed_indices",
+    "vision_pos_embed_weights",
+    "vision_rotary_pos_ids",
+    "vision_cu_seqlens",
+    "vision_max_seqlen",
+)
+
+
+def _merge_vision_grid_metadata(
+    batch: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge per-sample vision metadata without inspecting CUDA values."""
+    present = [field in batch[0] for field in _VISION_GRID_METADATA_FIELDS]
+    if not any(present):
+        return {}
+    if not all(present):
+        missing = [
+            field
+            for field, is_present in zip(_VISION_GRID_METADATA_FIELDS, present)
+            if not is_present
+        ]
+        raise ValueError(f"incomplete vision grid metadata; missing {missing}")
+    for sample in batch[1:]:
+        missing = [
+            field for field in _VISION_GRID_METADATA_FIELDS if field not in sample
+        ]
+        if missing:
+            raise ValueError(f"incomplete vision grid metadata; missing {missing}")
+
+    cu_seqlens_parts = [batch[0]["vision_cu_seqlens"][:1]]
+    patch_offset = 0
+    for sample in batch:
+        cu_seqlens_parts.append(sample["vision_cu_seqlens"][1:] + patch_offset)
+        patch_offset += sample["pixel_values"].shape[0]
+
+    return {
+        "vision_pos_embed_indices": torch.cat(
+            [sample["vision_pos_embed_indices"] for sample in batch], dim=1
+        ),
+        "vision_pos_embed_weights": torch.cat(
+            [sample["vision_pos_embed_weights"] for sample in batch], dim=1
+        ),
+        "vision_rotary_pos_ids": torch.cat(
+            [sample["vision_rotary_pos_ids"] for sample in batch], dim=0
+        ),
+        "vision_cu_seqlens": torch.cat(cu_seqlens_parts),
+        "vision_max_seqlen": max(sample["vision_max_seqlen"] for sample in batch),
+    }
 
 
 def pack_or_pad_batch(
@@ -242,12 +305,20 @@ def pack_or_pad_batch(
             for sample in batch:
                 seqlen = sample["input_ids"].shape[0]
                 assert (
-                    sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
+                    sample["labels"].shape
+                    == sample["input_ids"].shape
+                    == sample["loss_mask"].shape
                 ), "labels, input_ids, and loss_mask must have the same shape"
                 target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
-                labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
-                loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
+                input_ids_list.append(
+                    F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
+                )
+                labels_list.append(
+                    F.pad(sample["labels"], (0, target_len - seqlen), value=-100)
+                )
+                loss_mask_list.append(
+                    F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0)
+                )
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
                 pixel_values_list.append(sample["pixel_values"])
@@ -275,9 +346,12 @@ def pack_or_pad_batch(
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
             packed_batch["pixel_values"] = torch.concat(pixel_values_list)
             packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+            packed_batch.update(_merge_vision_grid_metadata(batch))
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
-            packed_batch["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+            packed_batch["cu_seqlens"] = torch.tensor(
+                cu_seqlens, dtype=torch.int32, device=device
+            )
             packed_batch["cu_seqlens_padded"] = torch.tensor(
                 cu_seqlens_padded, dtype=torch.int32, device=device
             )
@@ -288,7 +362,9 @@ def pack_or_pad_batch(
         cu_seqlens_padded_t = packed_batch.pop("cu_seqlens_padded")
         # Derive max_seqlen / total_tokens from the (broadcast) cu_seqlens —
         # no extra collective needed.
-        max_seqlen_q = int((cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item())
+        max_seqlen_q = int(
+            (cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item()
+        )
         total_tokens = int(cu_seqlens_padded_t[-1].item())
 
         packed_batch["packed_seq_params"] = PackedSeqParams(
@@ -304,7 +380,9 @@ def pack_or_pad_batch(
         return packed_batch
 
     # ---------- padded (BSHD) branch ----------
-    assert seq_length is not None, "seq_length must be provided when use_packed_sequence is False"
+    assert seq_length is not None, (
+        "seq_length must be provided when use_packed_sequence is False"
+    )
     padded_batch: Dict[str, Any] = {}
 
     if is_src:
@@ -321,30 +399,40 @@ def pack_or_pad_batch(
         real_seqlens = [s["input_ids"].shape[0] for s in batch]
 
         for sample in batch:
-            sample["input_ids"] = F.pad(
-                sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]), value=0
-            )
-            sample["labels"] = F.pad(
-                sample["labels"], (0, target_seqlens - sample["labels"].shape[0]), value=-100
-            )
-            sample["loss_mask"] = F.pad(
-                sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]), value=0
-            )
+            pad_amount = target_seqlens - sample["input_ids"].shape[0]
+            sample["input_ids"] = F.pad(sample["input_ids"], (0, pad_amount), value=0)
+            sample["labels"] = F.pad(sample["labels"], (0, pad_amount), value=-100)
+            sample["loss_mask"] = F.pad(sample["loss_mask"], (0, pad_amount), value=0)
+            if sample.get("position_ids") is not None:
+                sample["position_ids"] = F.pad(
+                    sample["position_ids"], (0, pad_amount), value=1
+                )
 
         padded_batch["input_ids"] = torch.concat(
             [x["input_ids"].unsqueeze(0) for x in batch], dim=0
         )
-        padded_batch["labels"] = torch.concat([x["labels"].unsqueeze(0) for x in batch], dim=0)
+        padded_batch["labels"] = torch.concat(
+            [x["labels"].unsqueeze(0) for x in batch], dim=0
+        )
         padded_batch["loss_mask"] = torch.concat(
             [x["loss_mask"].unsqueeze(0) for x in batch], dim=0
         )
+        if all(sample.get("position_ids") is not None for sample in batch):
+            padded_batch["position_ids"] = torch.stack(
+                [sample["position_ids"] for sample in batch], dim=0
+            )
         # Keep None as the known-no-padding fast path for MoE routing.
         has_padding = any(real_seqlen < target_seqlens for real_seqlen in real_seqlens)
         if has_padding:
             positions = torch.arange(target_seqlens).unsqueeze(0)
-            padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
+            padded_batch["padding_mask"] = positions >= torch.tensor(
+                real_seqlens
+            ).unsqueeze(1)
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
-        padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
+        padded_batch["image_grid_thw"] = torch.concat(
+            [x["image_grid_thw"] for x in batch]
+        )
+        padded_batch.update(_merge_vision_grid_metadata(batch))
 
     return broadcast_data_batch(padded_batch, device=device)
 
@@ -383,7 +471,9 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
             return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
-    batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
+    batch = pack_or_pad_batch(
+        data, args.use_packed_sequence, args.seq_length, device=device
+    )
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:
@@ -417,7 +507,9 @@ def loss_func(loss_mask, output_tensor):
 
     total_tokens = loss_mask.sum().clone().detach().to(torch.int)
     total_loss = torch.sum(losses.view(-1) * loss_mask)
-    reporting_loss = torch.cat([total_loss.clone().detach().view(1), total_tokens.view(1)])
+    reporting_loss = torch.cat(
+        [total_loss.clone().detach().view(1), total_tokens.view(1)]
+    )
 
     return (total_loss, total_tokens, {"lm loss": reporting_loss})
 
@@ -451,6 +543,15 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
 
     pixel_values = None if text_only_bypass else batch.get("pixel_values", None)
     image_grid_thw = None if text_only_bypass else batch.get("image_grid_thw", None)
+    vision_grid_metadata = None
+    if not text_only_bypass and batch.get("vision_pos_embed_indices") is not None:
+        vision_grid_metadata = {
+            "pos_embed_indices": batch["vision_pos_embed_indices"],
+            "pos_embed_weights": batch["vision_pos_embed_weights"],
+            "rotary_pos_ids": batch["vision_rotary_pos_ids"],
+            "cu_seqlens": batch["vision_cu_seqlens"],
+            "max_seqlen": batch["vision_max_seqlen"],
+        }
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
@@ -473,6 +574,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
             loss_mask=batch.get("loss_mask", None),
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            vision_grid_metadata=vision_grid_metadata,
             packed_seq_params=batch.get("packed_seq_params", None),
         )
 
@@ -496,6 +598,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
         padding_mask=batch.get("padding_mask", None),
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
+        vision_grid_metadata=vision_grid_metadata,
         packed_seq_params=batch.get("packed_seq_params", None),
     )
 
@@ -508,6 +611,8 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
     # so the slicing rule lives in one place.
     from examples.multimodal_dev.models.base import MultimodalModel
 
-    loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, batch.get("packed_seq_params", None))
+    loss_mask = MultimodalModel.cp_split_loss_mask(
+        loss_mask, batch.get("packed_seq_params", None)
+    )
 
     return output_tensor, partial(loss_func, loss_mask)
