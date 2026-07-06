@@ -12,6 +12,7 @@ position encoding (e.g. MRoPE for Qwen3.5-VL).
 """
 
 import contextlib
+import os
 from typing import Optional
 
 import torch
@@ -206,6 +207,8 @@ class MultimodalModel(MegatronModule):
                     image_grid_thw,
                     grid_metadata=vision_grid_metadata,
                 )
+            if os.getenv("MCORE_QWEN35_VL_DEBUG_DETACH_VISION_OUTPUT", "0") == "1":
+                vision_embeddings = vision_embeddings.detach()
 
         text_embeddings = self.language_model.embedding(
             input_ids=input_ids, position_ids=None
@@ -482,6 +485,8 @@ class MultimodalModel(MegatronModule):
                     image_grid_thw,
                     grid_metadata=vision_grid_metadata,
                 )
+            if os.getenv("MCORE_QWEN35_VL_DEBUG_DETACH_VISION_OUTPUT", "0") == "1":
+                vision_embeddings = vision_embeddings.detach()
 
         if decoder_input is None and self.language_model is not None:
             text_embeddings = self.language_model.embedding(
