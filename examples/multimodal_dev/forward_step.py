@@ -21,18 +21,23 @@ from megatron.core.parallel_state import (
 from megatron.training import get_args, print_rank_0
 
 
-_FULL_CG_TEXT_ONLY_BYPASS_LOGGED = False
+_TEXT_ONLY_PROXY_BYPASS_LOGGED = False
 
 
 def _is_full_iteration_cuda_graph(args) -> bool:
     return getattr(args, "cuda_graph_impl", "none") == "full_iteration"
 
 
-def _use_full_cg_text_only_bypass(args) -> bool:
-    return (
-        _is_full_iteration_cuda_graph(args)
-        and os.getenv("MCORE_QWEN35_VL_FULLCG_TEXT_ONLY", "0") == "1"
-    )
+def _use_text_only_proxy_bypass(args) -> bool:
+    """Select the decoder-only proxy path for matched eager/graph experiments."""
+    if os.getenv("MCORE_QWEN35_VL_TEXT_ONLY_PROXY", "0") == "1":
+        return True
+
+    # Retain the original full-CG-only escape hatch for existing recipes.
+    return _is_full_iteration_cuda_graph(args) and os.getenv(
+        "MCORE_QWEN35_VL_FULLCG_TEXT_ONLY", "0"
+    ) == "1"
+
 
 # -------------------------------------------------------------------
 # dtype <-> int mapping for cross-rank broadcast
@@ -434,15 +439,15 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
     if batch is None:
         return None, None
 
-    global _FULL_CG_TEXT_ONLY_BYPASS_LOGGED
+    global _TEXT_ONLY_PROXY_BYPASS_LOGGED
     args = get_args()
-    text_only_bypass = _use_full_cg_text_only_bypass(args)
-    if text_only_bypass and not _FULL_CG_TEXT_ONLY_BYPASS_LOGGED:
+    text_only_bypass = _use_text_only_proxy_bypass(args)
+    if text_only_bypass and not _TEXT_ONLY_PROXY_BYPASS_LOGGED:
         print_rank_0(
-            "WARNING: MCORE_QWEN35_VL_FULLCG_TEXT_ONLY=1 skips the vision encoder "
-            "and uses text-only positions; this run is not numerically valid for VL training."
+            "WARNING: Qwen3.5-VL text-only proxy mode skips the vision encoder and uses "
+            "text-only positions; this run is not numerically valid for VL training."
         )
-        _FULL_CG_TEXT_ONLY_BYPASS_LOGGED = True
+        _TEXT_ONLY_PROXY_BYPASS_LOGGED = True
 
     pixel_values = None if text_only_bypass else batch.get("pixel_values", None)
     image_grid_thw = None if text_only_bypass else batch.get("image_grid_thw", None)

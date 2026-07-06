@@ -144,9 +144,13 @@ batch-broadcast fast path is currently limited to TP=1.
 Qwen3.5-VL position IDs and vision-grid metadata are not yet graph-safe:
 `get_rope_index` and the vision encoder still contain host synchronization,
 Python control flow, and data-dependent shape operations. The experimental
-`MCORE_QWEN35_VL_FULLCG_TEXT_ONLY=1` escape hatch skips the vision encoder
-and uses text-only positions. It is intended only for decoder performance
-smoke tests and is not numerically valid for multimodal training.
+`MCORE_QWEN35_VL_TEXT_ONLY_PROXY=1` escape hatch skips the vision encoder and
+uses text-only positions independently of the graph mode, so eager and
+full-iteration graph decoder performance can be compared with matched inputs.
+It is intended only for decoder performance smoke tests and is not numerically
+valid for multimodal training. The legacy
+`MCORE_QWEN35_VL_FULLCG_TEXT_ONLY=1` variable remains supported when
+`--cuda-graph-impl full_iteration` is selected.
 
 ---
 
