@@ -113,12 +113,21 @@ def test_bshd_batch_preserves_positions_and_merges_vision_metadata(monkeypatch):
         ),
     )
 
+    samples = [_sample(0), _sample(10)]
+    static_fields = ("input_ids", "labels", "loss_mask", "position_ids")
+    static_input_refs = [
+        {field: sample[field] for field in static_fields} for sample in samples
+    ]
     batch = forward_step.pack_or_pad_batch(
-        [_sample(0), _sample(10)],
+        samples,
         use_packed_sequence=False,
         seq_length=4,
         device="cpu",
     )
+
+    for sample, refs in zip(samples, static_input_refs):
+        for field, original_tensor in refs.items():
+            assert sample[field] is original_tensor
 
     assert batch["position_ids"].shape == (2, 3, 4)
     torch.testing.assert_close(

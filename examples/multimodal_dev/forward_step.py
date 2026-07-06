@@ -394,8 +394,8 @@ def pack_or_pad_batch(
         if divisible_by > 1:
             target_seqlens = math.ceil(target_seqlens / divisible_by) * divisible_by
 
-        # Capture real lengths before in-place padding so we can build a
-        # padding_mask for MoE routing (True at collate-padded positions).
+        # Keep the static-loader input tensors intact. Rebinding sample dict
+        # entries here would make graph replay read the capture batch forever.
         real_seqlens = [s["input_ids"].shape[0] for s in batch]
         image_token_indices = None
         has_image_token_indices = [
@@ -411,29 +411,34 @@ def pack_or_pad_batch(
                 ]
             )
 
+        input_ids_list = []
+        labels_list = []
+        loss_mask_list = []
+        position_ids_list = []
+        has_position_ids = all(
+            sample.get("position_ids") is not None for sample in batch
+        )
         for sample in batch:
             pad_amount = target_seqlens - sample["input_ids"].shape[0]
-            sample["input_ids"] = F.pad(sample["input_ids"], (0, pad_amount), value=0)
-            sample["labels"] = F.pad(sample["labels"], (0, pad_amount), value=-100)
-            sample["loss_mask"] = F.pad(sample["loss_mask"], (0, pad_amount), value=0)
-            if sample.get("position_ids") is not None:
-                sample["position_ids"] = F.pad(
-                    sample["position_ids"], (0, pad_amount), value=1
+            input_ids_list.append(
+                F.pad(sample["input_ids"], (0, pad_amount), value=0)
+            )
+            labels_list.append(
+                F.pad(sample["labels"], (0, pad_amount), value=-100)
+            )
+            loss_mask_list.append(
+                F.pad(sample["loss_mask"], (0, pad_amount), value=0)
+            )
+            if has_position_ids:
+                position_ids_list.append(
+                    F.pad(sample["position_ids"], (0, pad_amount), value=1)
                 )
 
-        padded_batch["input_ids"] = torch.concat(
-            [x["input_ids"].unsqueeze(0) for x in batch], dim=0
-        )
-        padded_batch["labels"] = torch.concat(
-            [x["labels"].unsqueeze(0) for x in batch], dim=0
-        )
-        padded_batch["loss_mask"] = torch.concat(
-            [x["loss_mask"].unsqueeze(0) for x in batch], dim=0
-        )
-        if all(sample.get("position_ids") is not None for sample in batch):
-            padded_batch["position_ids"] = torch.stack(
-                [sample["position_ids"] for sample in batch], dim=0
-            )
+        padded_batch["input_ids"] = torch.stack(input_ids_list, dim=0)
+        padded_batch["labels"] = torch.stack(labels_list, dim=0)
+        padded_batch["loss_mask"] = torch.stack(loss_mask_list, dim=0)
+        if has_position_ids:
+            padded_batch["position_ids"] = torch.stack(position_ids_list, dim=0)
         # Keep None as the known-no-padding fast path for MoE routing.
         has_padding = any(real_seqlen < target_seqlens for real_seqlen in real_seqlens)
         if has_padding:
