@@ -75,6 +75,7 @@ def _sample(base, seq_length=4):
         "labels": torch.arange(base + 1, base + seq_length + 1),
         "loss_mask": torch.ones(seq_length),
         "position_ids": torch.arange(seq_length).repeat(3, 1) + base,
+        "image_token_indices": torch.tensor([1, 2]),
         "pixel_values": torch.full((32, 8), float(base)),
         "image_grid_thw": grid_thw,
         "vision_pos_embed_indices": metadata["pos_embed_indices"],
@@ -120,6 +121,9 @@ def test_bshd_batch_preserves_positions_and_merges_vision_metadata(monkeypatch):
     )
 
     assert batch["position_ids"].shape == (2, 3, 4)
+    torch.testing.assert_close(
+        batch["image_token_indices"], torch.tensor([1, 2, 5, 6])
+    )
     torch.testing.assert_close(
         batch["position_ids"][1],
         torch.arange(4).repeat(3, 1) + 10,

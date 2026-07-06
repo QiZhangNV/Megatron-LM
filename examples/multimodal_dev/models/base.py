@@ -177,6 +177,7 @@ class MultimodalModel(MegatronModule):
         loss_mask: Tensor = None,
         pixel_values: Tensor = None,
         image_grid_thw: Tensor = None,
+        image_token_indices: Tensor = None,
         vision_grid_metadata=None,
         packed_seq_params=None,
         **kwargs,
@@ -215,7 +216,10 @@ class MultimodalModel(MegatronModule):
         )
         if vision_embeddings is not None:
             decoder_input = self._scatter_vision_embeddings(
-                input_ids, text_embeddings, vision_embeddings
+                input_ids,
+                text_embeddings,
+                vision_embeddings,
+                image_token_indices=image_token_indices,
             )
         else:
             decoder_input = text_embeddings
@@ -251,7 +255,11 @@ class MultimodalModel(MegatronModule):
             )
 
     def _scatter_vision_embeddings(
-        self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
+        self,
+        input_ids: Tensor,
+        text_embeddings: Tensor,
+        vision_embeddings: Tensor,
+        image_token_indices: Tensor = None,
     ) -> Tensor:
         """Replace image-token positions with vision embeddings.
 
@@ -261,6 +269,8 @@ class MultimodalModel(MegatronModule):
             input_ids: ``[B, S]`` token IDs.
             text_embeddings: ``[S, B, D]`` (or ``[S/TP, B, D]`` with SP).
             vision_embeddings: ``[num_visual_tokens, D]``.
+            image_token_indices: Optional flattened token positions used by the
+                graph-safe ``index_copy`` path.
 
         Returns:
             Combined embeddings, same shape as *text_embeddings*.
@@ -276,9 +286,22 @@ class MultimodalModel(MegatronModule):
             )
 
         combined = text_embeddings.transpose(0, 1).contiguous()
-        image_mask = input_ids == self.image_token_id
-        mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(mask_expanded, vision_embeddings)
+        if image_token_indices is None:
+            image_mask = input_ids == self.image_token_id
+            mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
+            combined = combined.masked_scatter(mask_expanded, vision_embeddings)
+        else:
+            if image_token_indices.numel() != vision_embeddings.shape[0]:
+                raise ValueError(
+                    "image_token_indices and vision_embeddings must have the same "
+                    f"token count, got {image_token_indices.numel()} and "
+                    f"{vision_embeddings.shape[0]}"
+                )
+            combined_flat = combined.view(-1, combined.shape[-1])
+            combined_flat = combined_flat.index_copy(
+                0, image_token_indices, vision_embeddings
+            )
+            combined = combined_flat.view_as(combined)
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
@@ -439,6 +462,7 @@ class MultimodalModel(MegatronModule):
         padding_mask: Tensor = None,
         pixel_values: Tensor = None,
         image_grid_thw: Tensor = None,
+        image_token_indices: Tensor = None,
         vision_grid_metadata=None,
         decoder_input: Tensor = None,
         packed_seq_params=None,
@@ -460,6 +484,7 @@ class MultimodalModel(MegatronModule):
                 ``loss_mask``: only true padding, not SFT prompt tokens.
             pixel_values: Preprocessed image pixels.
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
+            image_token_indices: Optional flattened BSHD image-token positions.
             vision_grid_metadata: Optional precomputed, graph-safe grid
                 metadata for the vision encoder.
             decoder_input: Pre-computed decoder input (skip embed).
@@ -495,7 +520,10 @@ class MultimodalModel(MegatronModule):
 
             if vision_embeddings is not None:
                 decoder_input = self._scatter_vision_embeddings(
-                    input_ids, text_embeddings, vision_embeddings
+                    input_ids,
+                    text_embeddings,
+                    vision_embeddings,
+                    image_token_indices=image_token_indices,
                 )
             else:
                 decoder_input = text_embeddings

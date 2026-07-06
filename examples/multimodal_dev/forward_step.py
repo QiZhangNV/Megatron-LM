@@ -397,6 +397,19 @@ def pack_or_pad_batch(
         # Capture real lengths before in-place padding so we can build a
         # padding_mask for MoE routing (True at collate-padded positions).
         real_seqlens = [s["input_ids"].shape[0] for s in batch]
+        image_token_indices = None
+        has_image_token_indices = [
+            "image_token_indices" in sample for sample in batch
+        ]
+        if any(has_image_token_indices):
+            if not all(has_image_token_indices):
+                raise ValueError("image_token_indices must be present for every sample")
+            image_token_indices = torch.cat(
+                [
+                    sample["image_token_indices"] + batch_idx * target_seqlens
+                    for batch_idx, sample in enumerate(batch)
+                ]
+            )
 
         for sample in batch:
             pad_amount = target_seqlens - sample["input_ids"].shape[0]
@@ -432,6 +445,8 @@ def pack_or_pad_batch(
         padded_batch["image_grid_thw"] = torch.concat(
             [x["image_grid_thw"] for x in batch]
         )
+        if image_token_indices is not None:
+            padded_batch["image_token_indices"] = image_token_indices
         padded_batch.update(_merge_vision_grid_metadata(batch))
 
     return broadcast_data_batch(padded_batch, device=device)
@@ -574,6 +589,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
             loss_mask=batch.get("loss_mask", None),
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            image_token_indices=batch.get("image_token_indices"),
             vision_grid_metadata=vision_grid_metadata,
             packed_seq_params=batch.get("packed_seq_params", None),
         )
@@ -598,6 +614,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
         padding_mask=batch.get("padding_mask", None),
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
+        image_token_indices=batch.get("image_token_indices"),
         vision_grid_metadata=vision_grid_metadata,
         packed_seq_params=batch.get("packed_seq_params", None),
     )

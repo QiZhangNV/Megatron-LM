@@ -144,6 +144,9 @@ class MockQwen35VLDataset(Dataset):
             image_grid_thw=image_grid_thw,
         )
         position_ids = position_ids.squeeze(1)
+        image_token_indices = torch.nonzero(
+            input_ids == self.image_token_id, as_tuple=False
+        ).flatten()
 
         return {
             "input_ids": input_ids,
@@ -156,6 +159,7 @@ class MockQwen35VLDataset(Dataset):
             ),
             "max_seqlen": torch.tensor(self.seq_length, dtype=torch.int32),
             "position_ids": position_ids,
+            "image_token_indices": image_token_indices,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
             "vision_pos_embed_indices": self.vision_grid_metadata[
