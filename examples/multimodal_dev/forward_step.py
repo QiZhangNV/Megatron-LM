@@ -3,6 +3,7 @@
 """Forward step, TP broadcast, and loss for multimodal_dev training."""
 
 import math
+import os
 from functools import partial
 from itertools import accumulate
 from typing import Any, Dict, Iterator, Optional
@@ -17,7 +18,21 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
-from megatron.training import get_args
+from megatron.training import get_args, print_rank_0
+
+
+_FULL_CG_TEXT_ONLY_BYPASS_LOGGED = False
+
+
+def _is_full_iteration_cuda_graph(args) -> bool:
+    return getattr(args, "cuda_graph_impl", "none") == "full_iteration"
+
+
+def _use_full_cg_text_only_bypass(args) -> bool:
+    return (
+        _is_full_iteration_cuda_graph(args)
+        and os.getenv("MCORE_QWEN35_VL_FULLCG_TEXT_ONLY", "0") == "1"
+    )
 
 # -------------------------------------------------------------------
 # dtype <-> int mapping for cross-rank broadcast
@@ -83,6 +98,15 @@ def _broadcast_tensor(tensor, src, group, device):
 
 def broadcast_data_batch(data, device="cuda"):
     """Broadcast a data-batch dict from TP rank 0 to all TP ranks."""
+    if (
+        mpu.get_tensor_model_parallel_world_size() == 1
+        and _is_full_iteration_cuda_graph(get_args())
+    ):
+        # FullCudaGraphWrapper has already copied the raw batch into static CUDA
+        # buffers. Avoid the dynamic key/shape protocol, which performs host
+        # synchronizations that cannot be captured.
+        return data if data is not None else {}
+
     src = get_tensor_model_parallel_src_rank()
     group = get_tensor_model_parallel_group()
 
@@ -330,23 +354,28 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     device = "cuda"
     args = get_args()
 
-    if get_tensor_model_parallel_rank() == 0:
-        try:
-            data = next(data_iterator)
-            has_data = torch.tensor([1], dtype=torch.uint8, device=device)
-        except StopIteration:
-            has_data = torch.tensor([0], dtype=torch.uint8, device=device)
-            data = None
+    if _is_full_iteration_cuda_graph(args):
+        # FullCudaGraphWrapper owns dataloader exhaustion and provides an
+        # iterator over preloaded static CUDA buffers.
+        data = next(data_iterator) if get_tensor_model_parallel_rank() == 0 else None
     else:
-        has_data = torch.empty(1, dtype=torch.uint8, device=device)
-        data = None
+        if get_tensor_model_parallel_rank() == 0:
+            try:
+                data = next(data_iterator)
+                has_data = torch.tensor([1], dtype=torch.uint8, device=device)
+            except StopIteration:
+                has_data = torch.tensor([0], dtype=torch.uint8, device=device)
+                data = None
+        else:
+            has_data = torch.empty(1, dtype=torch.uint8, device=device)
+            data = None
 
-    src = get_tensor_model_parallel_src_rank()
-    group = get_tensor_model_parallel_group()
-    torch.distributed.broadcast(has_data, src, group=group)
+        src = get_tensor_model_parallel_src_rank()
+        group = get_tensor_model_parallel_group()
+        torch.distributed.broadcast(has_data, src, group=group)
 
-    if has_data.item() == 0:
-        return None
+        if has_data.item() == 0:
+            return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
@@ -405,7 +434,18 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
     if batch is None:
         return None, None
 
-    pixel_values = batch.get("pixel_values", None)
+    global _FULL_CG_TEXT_ONLY_BYPASS_LOGGED
+    args = get_args()
+    text_only_bypass = _use_full_cg_text_only_bypass(args)
+    if text_only_bypass and not _FULL_CG_TEXT_ONLY_BYPASS_LOGGED:
+        print_rank_0(
+            "WARNING: MCORE_QWEN35_VL_FULLCG_TEXT_ONLY=1 skips the vision encoder "
+            "and uses text-only positions; this run is not numerically valid for VL training."
+        )
+        _FULL_CG_TEXT_ONLY_BYPASS_LOGGED = True
+
+    pixel_values = None if text_only_bypass else batch.get("pixel_values", None)
+    image_grid_thw = None if text_only_bypass else batch.get("image_grid_thw", None)
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
@@ -427,7 +467,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
             labels=batch.get("labels", None),
             loss_mask=batch.get("loss_mask", None),
             pixel_values=pixel_values,
-            image_grid_thw=batch.get("image_grid_thw", None),
+            image_grid_thw=image_grid_thw,
             packed_seq_params=batch.get("packed_seq_params", None),
         )
 
@@ -450,7 +490,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
         loss_mask=batch.get("loss_mask", None),
         padding_mask=batch.get("padding_mask", None),
         pixel_values=pixel_values,
-        image_grid_thw=batch.get("image_grid_thw", None),
+        image_grid_thw=image_grid_thw,
         packed_seq_params=batch.get("packed_seq_params", None),
     )
 

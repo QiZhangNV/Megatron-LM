@@ -138,6 +138,21 @@ class MultimodalModel(MegatronModule):
             mtp_block_spec=mtp_block_spec,
         )
 
+    @property
+    def decoder(self):
+        """Expose the language decoder to wrappers that operate on GPT-like models."""
+        return self.language_model.decoder
+
+    @property
+    def mtp_process(self):
+        """Expose whether the wrapped language model owns MTP layers."""
+        return self.language_model.mtp_process
+
+    @property
+    def mtp(self):
+        """Expose the wrapped language model's MTP block when configured."""
+        return getattr(self.language_model, "mtp", None)
+
     def set_input_tensor(self, input_tensor):
         """Route input tensors (simplified, no PP routing)."""
         if not isinstance(input_tensor, list):

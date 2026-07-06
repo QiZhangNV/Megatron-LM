@@ -205,21 +205,21 @@ class StaticBufferLoader:
         if isinstance(inputs, tuple) and isinstance(inputs[0], dict):
             inputs = inputs[0]
 
-        assert isinstance(inputs, dict)
+        assert isinstance(inputs, (dict, list))
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
-
-            for k in inputs.keys():
-                if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
-                    if isinstance(inputs[k], torch.Tensor):
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
-                            inputs[k], device="cuda"
-                        )
-                    else:
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
+            if isinstance(inputs, dict):
+                for k in inputs.keys():
+                    if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
+                        if isinstance(inputs[k], torch.Tensor):
+                            StaticBufferLoader.static_buffers[stage][microbatch][k] = (
+                                torch.empty_like(inputs[k], device="cuda")
+                            )
+                        else:
+                            StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
