@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import torch
 
-import examples.multimodal_dev.forward_step as forward_step
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
     Qwen35VLVisionEncoder,
     build_vision_grid_metadata,
@@ -87,6 +86,8 @@ def _sample(base, seq_length=4):
 
 
 def test_bshd_batch_preserves_positions_and_merges_vision_metadata(monkeypatch):
+    import examples.multimodal_dev.forward_step as forward_step
+
     monkeypatch.setattr(
         forward_step.mpu,
         "get_tensor_model_parallel_world_size",
