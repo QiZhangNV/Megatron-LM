@@ -1896,7 +1896,7 @@ class TECudaGraphHelper:
                 )
             else:
                 num_decoder_layers = len(chunk_with_decoder.decoder.layers)
-                if hasattr(chunk_with_decoder, 'mtp'):
+                if getattr(chunk_with_decoder, 'mtp_process', False):
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
@@ -2904,7 +2904,7 @@ def set_current_microbatch(model, microbatch_id):
     if decoder_exists and model_with_decoder is not None:
         for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id
-        if hasattr(model_with_decoder, 'mtp'):
+        if getattr(model_with_decoder, 'mtp_process', False):
             for layer in model_with_decoder.mtp.layers:
                 assert hasattr(
                     layer, 'mtp_model_layer'
