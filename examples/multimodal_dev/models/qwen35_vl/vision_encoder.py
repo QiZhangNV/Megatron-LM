@@ -20,6 +20,7 @@ Key design choices:
     processor) so the merger's simple reshape is correct.
 """
 
+import os
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -756,10 +757,17 @@ class Qwen35VLVisionEncoder(VisionModule):
         """
         # 1. Patch embedding (Conv3d)
         hidden_states = self.patch_embed(pixel_values)
+        debug_detach_stage = os.getenv(
+            "MCORE_QWEN35_VL_DEBUG_DETACH_VISION_STAGE", ""
+        )
+        if debug_detach_stage == "patch_embed":
+            hidden_states = hidden_states.detach()
 
         # 2. Learned position embedding (bilinear interpolation)
         pos_embeds = self._fast_pos_embed_interpolate(grid_thw, grid_metadata)
         hidden_states = hidden_states + pos_embeds
+        if debug_detach_stage == "position":
+            hidden_states = hidden_states.detach()
 
         # 3. 2D Vision RoPE
         rot_freqs = self._compute_rotary_pos_emb(grid_thw, grid_metadata)
@@ -777,6 +785,8 @@ class Qwen35VLVisionEncoder(VisionModule):
             packed_seq_params=packed_seq_params,
         )
         hidden_states = hidden_states.squeeze(1)
+        if debug_detach_stage == "decoder":
+            hidden_states = hidden_states.detach()
 
         # 5. Patch merger
         return self.merger(hidden_states)
