@@ -134,6 +134,20 @@ This implementation does not create inference CUDA graphs. For inference, use
 --no-check-for-nan-in-loss-and-grad
 ```
 
+### Multimodal development constraints
+
+Full-iteration capture requires static input structure and device-resident
+metadata. The `examples/multimodal_dev` path supports its vanilla
+`list[dict]` batches through `StaticBufferLoader`, but its capture-time
+batch-broadcast fast path is currently limited to TP=1.
+
+Qwen3.5-VL position IDs and vision-grid metadata are not yet graph-safe:
+`get_rope_index` and the vision encoder still contain host synchronization,
+Python control flow, and data-dependent shape operations. The experimental
+`MCORE_QWEN35_VL_FULLCG_TEXT_ONLY=1` escape hatch skips the vision encoder
+and uses text-only positions. It is intended only for decoder performance
+smoke tests and is not numerically valid for multimodal training.
+
 ---
 
 ## Common Configuration Examples
