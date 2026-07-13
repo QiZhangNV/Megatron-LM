@@ -1777,10 +1777,12 @@ def validate_args(args, defaults={}):
             token is not None for token in extra_tokens
         ), "FIM extra tokens should be specified."
 
-    assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
-        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
-        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
-    )
+    if args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te':
+        assert os.getenv("NVTE_FUSED_CE_GRAD_FIX") == "1", (
+            "Transformer Engine cross entropy loss fusion requires the BF16 gradient-precision "
+            "fix from NVIDIA/TransformerEngine PR #3193. Use an image that declares "
+            "NVTE_FUSED_CE_GRAD_FIX=1 after validating the patched implementation."
+        )
 
     # Deterministic mode
     if args.deterministic_mode:

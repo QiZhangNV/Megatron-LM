@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, ContextManager, Literal, Optional
@@ -485,11 +486,14 @@ class ModelParallelConfig:
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
 
-        if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te':
+        if (
+            self.cross_entropy_loss_fusion
+            and self.cross_entropy_fusion_impl == 'te'
+            and os.getenv("NVTE_FUSED_CE_GRAD_FIX") != "1"
+        ):
             warnings.warn(
-                "Transformer Engine cross entropy loss fusion has known stability issues. "
-                "Megatron-LM training args validation rejects this combination by default. "
-                "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
+                "Transformer Engine cross entropy loss fusion requires the BF16 gradient-precision "
+                "fix from NVIDIA/TransformerEngine PR #3193.",
                 UserWarning,
                 stacklevel=2,
             )
