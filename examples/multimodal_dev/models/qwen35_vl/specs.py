@@ -20,7 +20,9 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
-def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+def _apply_rope_fp32(
+    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
@@ -74,11 +76,14 @@ def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=Non
         mscale=mscale,
         cp_group=cp_group,
         mla_rotary_interleaved=getattr(config, 'multi_latent_attention', False),
+        max_seqlen=max_seqlen,
     )
     return out.to(orig_dtype)
 
 
-def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+def _apply_rope_fp32_no_cp(
+    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
     The vision encoder uses THD packed sequences for variable-resolution
@@ -96,6 +101,7 @@ def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_gro
             cu_seqlens,
             mscale,
             cp_group=_NO_CP_GROUP,
+            max_seqlen=max_seqlen,
         )
     finally:
         nvtx_range_pop(range_name)

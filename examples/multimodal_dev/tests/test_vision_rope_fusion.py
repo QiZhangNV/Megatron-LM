@@ -174,6 +174,33 @@ def test_vision_fp32_wrapper_dispatches_raw_freqs_to_fused_mrope_thd(monkeypatch
     }
 
 
+def test_vision_fp32_wrapper_forwards_max_seqlen_to_unfused_thd(monkeypatch):
+    calls = {}
+
+    def fake_apply_rotary_pos_emb(t, freqs, **kwargs):
+        calls.update(kwargs)
+        return t
+
+    monkeypatch.setattr(rope_utils, "apply_rotary_pos_emb", fake_apply_rotary_pos_emb)
+
+    config = SimpleNamespace(
+        apply_rope_fusion=False,
+        multi_latent_attention=False,
+    )
+    t = torch.zeros(6, 2, 8, dtype=torch.bfloat16)
+    freqs = torch.zeros(3, 1, 1, 8, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+    out = _apply_rope_fp32_no_cp(
+        t, freqs, config, cu_seqlens=cu_seqlens, max_seqlen=3
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert calls["max_seqlen"] == 3
+    assert calls["cp_group"].size() == 1
+    assert calls["cp_group"].rank() == 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
 def test_vision_fused_rope_matches_unfused_forward_backward_cuda():
