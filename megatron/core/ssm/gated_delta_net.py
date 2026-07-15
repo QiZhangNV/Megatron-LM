@@ -281,8 +281,10 @@ class GatedDeltaNet(MegatronModule):
         # the entire GatedDeltaNet compute is wrapped in a normal checkpoint and recomputed
         # in the backward pass.
         self.recompute_gdn = False
+        self.recompute_norm_out = False
         if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_gdn = "gdn" in self.config.recompute_modules
+            self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
 
         # Cache for CP context objects consumed by FLA kernels. Rebuilding these per-forward
         # is unsafe under CUDA graph capture because build_cp_context allocates
@@ -600,41 +602,54 @@ class GatedDeltaNet(MegatronModule):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
+        def _gated_norm_and_a2a(core_attn_out, gate):
+            nvtx_range_push(suffix="gated_norm")
+            norm_out = self._apply_gated_norm(core_attn_out, gate)
+            nvtx_range_pop(suffix="gated_norm")
 
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
+            norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
+            norm_out = norm_out.transpose(0, 1).contiguous()
 
-        # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
-        # Restores the Megatron attention-load-balanced layout that downstream
-        # layers and loss computation expect.
-        # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous and
-        # restore zigzag only at SDPA/canonical-layout boundaries.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="contiguous_to_zigzag")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0
-                )
-            nvtx_range_pop(suffix="contiguous_to_zigzag")
+            if cp_size_chunkwise > 1:
+                nvtx_range_push(suffix="contiguous_to_zigzag")
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                    norm_out = contiguous_to_zigzag_chunks(
+                        norm_out,
+                        cp_group=cp_group_chunkwise,
+                        seq_dim=0,
+                        cu_seqlens=cu_seqlens_q,
+                    )
+                else:
+                    norm_out = contiguous_to_zigzag_chunks(
+                        norm_out, cp_group=cp_group_chunkwise, seq_dim=0
+                    )
+                nvtx_range_pop(suffix="contiguous_to_zigzag")
 
-        norm_out = self._a2a_hp_to_cp(
-            norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
-        )
+            return self._a2a_hp_to_cp(
+                norm_out,
+                cp_size_headwise,
+                cp_group_headwise,
+                packed_seq_params,
+                thd_cp_a2a_inv,
+            )
+
+        recompute_norm_out = self.recompute_norm_out and self.training
+        if recompute_norm_out:
+            norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_out = norm_out_checkpoint.checkpoint(
+                _gated_norm_and_a2a, core_attn_out, gate
+            )
+        else:
+            norm_out_checkpoint = None
+            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
+
+        if norm_out_checkpoint is not None:
+            norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
 
