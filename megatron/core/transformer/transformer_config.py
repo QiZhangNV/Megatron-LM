@@ -771,8 +771,8 @@ class TransformerConfig(ModelParallelConfig):
     use_mok_megakernel: bool = False
     """Experimental: replace MoE dispatch, routed/shared expert MLPs, and combine with
     the external Mixture-of-Kittens megakernel. MCore still owns routing and trainable
-    parameters. This path currently requires TP=1, a shared expert, and
-    gradient_accumulation_fusion=False; routed weights may use BF16 or MXFP8."""
+    parameters. This path currently requires TP=1 and a shared expert. Routed weights may
+    use BF16 or MXFP8; fused gradient accumulation is currently BF16-only."""
 
     mok_fwd_num_comm_sms: int = 40
     """Number of communication SMs used by the MoK forward megakernel."""
@@ -2096,10 +2096,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("use_mok_megakernel does not support latent MoE")
             if not self.gated_linear_unit or self.activation_func != F.silu:
                 raise ValueError("use_mok_megakernel currently requires SwiGLU")
-            if self.gradient_accumulation_fusion:
+            if self.gradient_accumulation_fusion and self.mok_use_mxfp8_weights:
                 raise ValueError(
-                    "use_mok_megakernel currently requires "
-                    "gradient_accumulation_fusion=False"
+                    "use_mok_megakernel currently supports gradient accumulation "
+                    "fusion only with BF16 routed weights"
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
