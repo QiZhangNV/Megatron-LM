@@ -102,6 +102,9 @@ class _MoKAutograd(torch.autograd.Function):
             num_local_experts=module.num_local_experts,
         )
         gate_q, up_q, down_q = module.quantized_routed_weights()
+        gate_forward = gate_q[:2] if isinstance(gate_q, tuple) else gate_q
+        up_forward = up_q[:2] if isinstance(up_q, tuple) else up_q
+        down_forward = down_q[:2] if isinstance(down_q, tuple) else down_q
         output, forward_context = functional.forward(
             module.mok_config,
             workspace,
@@ -111,9 +114,9 @@ class _MoKAutograd(torch.autograd.Function):
             shared_gate,
             shared_up,
             shared_down,
-            gate_q[:2],
-            up_q[:2],
-            down_q[:2],
+            gate_forward,
+            up_forward,
+            down_forward,
             swiglu_limit=module.swiglu_limit,
         )
 
@@ -149,6 +152,9 @@ class _MoKAutograd(torch.autograd.Function):
             shared_down,
         ) = ctx.saved_tensors
         gate_q, up_q, down_q = ctx.quantized_weights
+        backward_gate = gate_q
+        backward_up = up_q
+        backward_down = down_q[2:] if isinstance(down_q, tuple) else down_q
         (
             d_x,
             d_router_weights,
@@ -169,9 +175,9 @@ class _MoKAutograd(torch.autograd.Function):
             shared_gate,
             shared_up,
             shared_down,
-            gate_q,
-            up_q,
-            down_q[2:],
+            backward_gate,
+            backward_up,
+            backward_down,
             swiglu_limit=ctx.module.swiglu_limit,
         )
 
@@ -228,6 +234,7 @@ class MoKMegakernel(nn.Module):
         self.shared_intermediate_size = config.moe_shared_expert_intermediate_size
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
+        self.use_mxfp8_weights = config.mok_use_mxfp8_weights
         self.mok_config = MoKConfig(
             fwd_num_comm_sms=config.mok_fwd_num_comm_sms,
             bwd_num_comm_sms=config.mok_bwd_num_comm_sms,
@@ -235,6 +242,7 @@ class MoKMegakernel(nn.Module):
             macrobatch_size=config.mok_macrobatch_size,
             schedule_capacity_multiplier=config.mok_schedule_capacity_multiplier,
             all_gather_top_experts_chunk_bytes=config.mok_all_gather_top_experts_chunk_bytes,
+            scale_router_before_fc2=config.mok_scale_router_before_fc2,
         )
 
         self._import_routed_weights(routed_experts)
@@ -299,6 +307,13 @@ class MoKMegakernel(nn.Module):
     @torch.no_grad()
     def quantized_routed_weights(self):
         """Refresh normal+transposed MXFP8 copies once per optimizer iteration."""
+        if not self.use_mxfp8_weights:
+            return (
+                self.routed_gate_weight,
+                self.routed_up_weight,
+                self.routed_down_weight,
+            )
+
         from mok.ops import mxfp8_quantize
 
         versions = (

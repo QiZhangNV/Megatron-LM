@@ -771,8 +771,8 @@ class TransformerConfig(ModelParallelConfig):
     use_mok_megakernel: bool = False
     """Experimental: replace MoE dispatch, routed/shared expert MLPs, and combine with
     the external Mixture-of-Kittens megakernel. MCore still owns routing and trainable
-    parameters. This path currently requires MXFP8, TP=1, a shared expert, and
-    gradient_accumulation_fusion=False."""
+    parameters. This path currently requires TP=1, a shared expert, and
+    gradient_accumulation_fusion=False; routed weights may use BF16 or MXFP8."""
 
     mok_fwd_num_comm_sms: int = 40
     """Number of communication SMs used by the MoK forward megakernel."""
@@ -791,6 +791,13 @@ class TransformerConfig(ModelParallelConfig):
 
     mok_all_gather_top_experts_chunk_bytes: int = 2048
     """Chunk size for MoK symmetric-memory expert-ID all-gather."""
+
+    mok_use_mxfp8_weights: bool = True
+    """Use MOK's MXFP8 routed-expert path; otherwise use BF16 routed weights."""
+
+    mok_scale_router_before_fc2: bool = False
+    """Apply router probabilities before routed FC2-input MXFP8 quantization to match
+    MCore GroupedMLP numerical ordering. This is ignored by the BF16 path."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -2071,7 +2078,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.use_mok_megakernel:
-            if not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+            if self.mok_use_mxfp8_weights and (
+                not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8
+            ):
                 raise ValueError("use_mok_megakernel currently requires fp8_recipe=mxfp8")
             if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
                 raise ValueError("use_mok_megakernel currently requires TP=1 and expert TP=1")
