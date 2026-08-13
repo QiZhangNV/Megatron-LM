@@ -41,3 +41,25 @@ def test_accumulate_weight_gradient_rejects_shape_mismatch():
         mok_megakernel._accumulate_weight_gradient(
             param, torch.zeros((2, 16), dtype=torch.bfloat16)
         )
+
+
+def test_finish_weight_gradient_marks_ready_without_accumulating(monkeypatch):
+    param = _parameter_with_main_grad()
+    param.main_grad.fill_(0.25)
+    dummy = torch.empty_like(param)
+    monkeypatch.setattr(mok_megakernel, "_dummy_weight_gradient", lambda _: dummy)
+
+    actual = mok_megakernel._finish_weight_gradient(param)
+
+    assert actual is dummy
+    torch.testing.assert_close(param.main_grad, torch.full_like(param.main_grad, 0.25))
+    assert param.grad_added_to_main_grad
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_main_grad_buffer_requires_contiguous_fp32(dtype):
+    param = torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))
+    param.main_grad = torch.zeros((4, 8), dtype=dtype)
+
+    with pytest.raises(RuntimeError, match="contiguous FP32"):
+        mok_megakernel._main_grad_buffer(param)

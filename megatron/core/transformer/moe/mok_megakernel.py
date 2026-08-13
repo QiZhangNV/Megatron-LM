@@ -74,32 +74,44 @@ def _dummy_weight_gradient(param: nn.Parameter) -> torch.Tensor:
     return get_dummy_wgrad(list(param.shape), param.dtype)
 
 
-@torch.no_grad()
-def _accumulate_weight_gradient(param: nn.Parameter, grad: torch.Tensor) -> torch.Tensor:
-    """Accumulate one MOK wgrad into MCore's buffer and return a hook-only gradient.
-
-    MOK currently materializes BF16 weight gradients. With MCore gradient
-    accumulation fusion enabled, the optimizer-visible destination is
-    ``param.main_grad`` (FP32 in the DSv4 proxy). Writing it here recovers fused
-    accumulation for the rest of the model while preserving the DDP hook that
-    marks this parameter ready for reduce-scatter.
-    """
+def _main_grad_buffer(param: nn.Parameter) -> torch.Tensor:
+    """Return and validate the optimizer-visible FP32 gradient buffer."""
     main_grad = getattr(param, "main_grad", None)
     if main_grad is None:
         raise RuntimeError(
             "MOK gradient accumulation fusion requires DDP to assign param.main_grad"
         )
+    if main_grad.shape != param.shape:
+        raise RuntimeError(
+            "MOK weight-gradient shape mismatch: "
+            f"main_grad={tuple(main_grad.shape)}, param={tuple(param.shape)}"
+        )
+    if main_grad.dtype != torch.float32 or not main_grad.is_contiguous():
+        raise RuntimeError("MOK direct accumulation requires contiguous FP32 main_grad")
+    if getattr(param, "zero_out_wgrad", False):
+        raise RuntimeError("MOK does not support zero_out_wgrad parameters")
+    if main_grad.device != param.device:
+        raise RuntimeError("MOK main_grad must be on the parameter device")
+    return main_grad
+
+
+def _finish_weight_gradient(param: nn.Parameter) -> torch.Tensor:
+    """Mark an in-kernel accumulation complete and return a DDP hook-only grad."""
+    param.grad_added_to_main_grad = True
+    return _dummy_weight_gradient(param)
+
+
+@torch.no_grad()
+def _accumulate_weight_gradient(param: nn.Parameter, grad: torch.Tensor) -> torch.Tensor:
+    """Accumulate a materialized wgrad; fallback for non-fused MOK precisions."""
+    main_grad = _main_grad_buffer(param)
     if main_grad.shape != grad.shape:
         raise RuntimeError(
             "MOK weight-gradient shape mismatch: "
             f"main_grad={tuple(main_grad.shape)}, grad={tuple(grad.shape)}"
         )
-    if getattr(param, "zero_out_wgrad", False):
-        raise RuntimeError("MOK does not support zero_out_wgrad parameters")
-
     main_grad.add_(grad)
-    param.grad_added_to_main_grad = True
-    return _dummy_weight_gradient(param)
+    return _finish_weight_gradient(param)
 
 
 class _MoKAutograd(torch.autograd.Function):
@@ -189,6 +201,19 @@ class _MoKAutograd(torch.autograd.Function):
         backward_gate = gate_q
         backward_up = up_q
         backward_down = down_q[2:] if isinstance(down_q, tuple) else down_q
+        direct_wgrad_accumulation = (
+            ctx.module.fuse_wgrad_accumulation and not ctx.module.use_mxfp8_weights
+        )
+        main_grads = None
+        if direct_wgrad_accumulation:
+            main_grads = (
+                _main_grad_buffer(ctx.module.shared_gate_weight),
+                _main_grad_buffer(ctx.module.routed_gate_weight),
+                _main_grad_buffer(ctx.module.shared_up_weight),
+                _main_grad_buffer(ctx.module.routed_up_weight),
+                _main_grad_buffer(ctx.module.shared_down_weight),
+                _main_grad_buffer(ctx.module.routed_down_weight),
+            )
         (
             d_x,
             d_router_weights,
@@ -213,27 +238,21 @@ class _MoKAutograd(torch.autograd.Function):
             backward_up,
             backward_down,
             swiglu_limit=ctx.module.swiglu_limit,
+            main_grads=main_grads,
         )
 
         if ctx.module.fuse_wgrad_accumulation:
-            d_routed_gate = _accumulate_weight_gradient(
-                ctx.module.routed_gate_weight, d_routed_gate
-            )
-            d_routed_up = _accumulate_weight_gradient(
-                ctx.module.routed_up_weight, d_routed_up
-            )
-            d_routed_down = _accumulate_weight_gradient(
-                ctx.module.routed_down_weight, d_routed_down
-            )
-            d_shared_gate = _accumulate_weight_gradient(
-                ctx.module.shared_gate_weight, d_shared_gate
-            )
-            d_shared_up = _accumulate_weight_gradient(
-                ctx.module.shared_up_weight, d_shared_up
-            )
-            d_shared_down = _accumulate_weight_gradient(
-                ctx.module.shared_down_weight, d_shared_down
-            )
+            def finalize(param: nn.Parameter, grad: torch.Tensor) -> torch.Tensor:
+                if direct_wgrad_accumulation:
+                    return _finish_weight_gradient(param)
+                return _accumulate_weight_gradient(param, grad)
+
+            d_routed_gate = finalize(ctx.module.routed_gate_weight, d_routed_gate)
+            d_routed_up = finalize(ctx.module.routed_up_weight, d_routed_up)
+            d_routed_down = finalize(ctx.module.routed_down_weight, d_routed_down)
+            d_shared_gate = finalize(ctx.module.shared_gate_weight, d_shared_gate)
+            d_shared_up = finalize(ctx.module.shared_up_weight, d_shared_up)
+            d_shared_down = finalize(ctx.module.shared_down_weight, d_shared_down)
 
         ctx.module = None
         ctx.workspace = None
