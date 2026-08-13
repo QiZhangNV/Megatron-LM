@@ -170,16 +170,18 @@ class _MoKAutograd(torch.autograd.Function):
             top_experts,
             num_local_experts=module.num_local_experts,
         )
-        _debug_record(
-            "forward.after_param_sync_before_quantize",
-            module.routed_gate_weight,
-            tensors={"main_grad": getattr(module.routed_gate_weight, "main_grad", None)},
-        )
+        trace_param_lifecycle = module.is_first_microbatch
+        if trace_param_lifecycle:
+            _debug_record(
+                "forward.after_param_sync_before_quantize",
+                module.routed_gate_weight,
+                tensors={"main_grad": getattr(module.routed_gate_weight, "main_grad", None)},
+            )
         gate_q, up_q, down_q = module.quantized_routed_weights()
         gate_forward = gate_q[:2] if isinstance(gate_q, tuple) else gate_q
         up_forward = up_q[:2] if isinstance(up_q, tuple) else up_q
         down_forward = down_q[:2] if isinstance(down_q, tuple) else down_q
-        if isinstance(gate_q, tuple):
+        if trace_param_lifecycle and isinstance(gate_q, tuple):
             _debug_record(
                 "forward.mok_quantized_weight_cache",
                 module.routed_gate_weight,
@@ -212,6 +214,7 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = schedule
         ctx.forward_context = forward_context
         ctx.quantized_weights = (gate_q, up_q, down_q)
+        ctx.trace_param_lifecycle = trace_param_lifecycle
         ctx.save_for_backward(
             x,
             router_weights,
@@ -253,23 +256,24 @@ class _MoKAutograd(torch.autograd.Function):
                 _main_grad_buffer(ctx.module.shared_down_weight),
                 _main_grad_buffer(ctx.module.routed_down_weight),
             )
-        backward_debug_tensors = {
-            "main_grad_before": getattr(ctx.module.routed_gate_weight, "main_grad", None)
-        }
-        if isinstance(backward_gate, tuple):
-            backward_debug_tensors.update(
-                {
-                    "actual_backward_rowwise_data": backward_gate[0],
-                    "actual_backward_rowwise_scale": backward_gate[1],
-                    "actual_backward_columnwise_data": backward_gate[2],
-                    "actual_backward_columnwise_scale": backward_gate[3],
-                }
+        if ctx.trace_param_lifecycle:
+            backward_debug_tensors = {
+                "main_grad_before": getattr(ctx.module.routed_gate_weight, "main_grad", None)
+            }
+            if isinstance(backward_gate, tuple):
+                backward_debug_tensors.update(
+                    {
+                        "actual_backward_rowwise_data": backward_gate[0],
+                        "actual_backward_rowwise_scale": backward_gate[1],
+                        "actual_backward_columnwise_data": backward_gate[2],
+                        "actual_backward_columnwise_scale": backward_gate[3],
+                    }
+                )
+            _debug_record(
+                "backward.before_mok_kernel",
+                ctx.module.routed_gate_weight,
+                tensors=backward_debug_tensors,
             )
-        _debug_record(
-            "backward.before_mok_kernel",
-            ctx.module.routed_gate_weight,
-            tensors=backward_debug_tensors,
-        )
         (
             d_x,
             d_router_weights,
@@ -297,13 +301,14 @@ class _MoKAutograd(torch.autograd.Function):
             main_grads=main_grads,
         )
 
-        _debug_record(
-            "backward.after_mok_kernel",
-            ctx.module.routed_gate_weight,
-            tensors={
-                "main_grad_after": getattr(ctx.module.routed_gate_weight, "main_grad", None)
-            },
-        )
+        if ctx.trace_param_lifecycle:
+            _debug_record(
+                "backward.after_mok_kernel",
+                ctx.module.routed_gate_weight,
+                tensors={
+                    "main_grad_after": getattr(ctx.module.routed_gate_weight, "main_grad", None)
+                },
+            )
         if ctx.module.fuse_wgrad_accumulation:
             d_routed_gate = _finish_weight_gradient(ctx.module.routed_gate_weight)
             d_routed_up = _finish_weight_gradient(ctx.module.routed_up_weight)
