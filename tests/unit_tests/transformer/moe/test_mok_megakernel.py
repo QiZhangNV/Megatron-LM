@@ -63,3 +63,106 @@ def test_main_grad_buffer_requires_contiguous_fp32(dtype):
 
     with pytest.raises(RuntimeError, match="contiguous FP32"):
         mok_megakernel._main_grad_buffer(param)
+
+
+def _parameter_with_preserved_init(init_val):
+    param = torch.nn.Parameter(torch.zeros(init_val.shape, dtype=torch.bfloat16))
+    cleared = []
+    param.get_high_precision_init_val = lambda: init_val
+    param.clear_high_precision_init_val = lambda: cleared.append(True)
+    return param, cleared
+
+
+def test_import_weights_preserves_reordered_init_for_optimizer(monkeypatch):
+    class Stub:
+        pass
+
+    monkeypatch.setattr(mok_megakernel, "_debug_tag", lambda *_: None)
+
+    hidden_size = 3
+    routed_intermediate = 2
+    shared_intermediate = 1
+    num_experts = 2
+
+    routed = Stub()
+    routed.linear_fc1 = Stub()
+    routed.linear_fc2 = Stub()
+    routed.linear_fc1.single_grouped_weight = False
+    routed.linear_fc2.single_grouped_weight = False
+
+    routed_fc1_init = []
+    routed_fc2_init = []
+    cleared = []
+    for expert_idx in range(num_experts):
+        fc1_init = (
+            torch.arange(2 * routed_intermediate * hidden_size, dtype=torch.float32)
+            .reshape(2 * routed_intermediate, hidden_size)
+            .add_(100 * expert_idx + 0.125)
+        )
+        fc2_init = (
+            torch.arange(hidden_size * routed_intermediate, dtype=torch.float32)
+            .reshape(hidden_size, routed_intermediate)
+            .add_(100 * expert_idx + 0.375)
+        )
+        fc1_param, fc1_cleared = _parameter_with_preserved_init(fc1_init)
+        fc2_param, fc2_cleared = _parameter_with_preserved_init(fc2_init)
+        setattr(routed.linear_fc1, f"weight{expert_idx}", fc1_param)
+        setattr(routed.linear_fc2, f"weight{expert_idx}", fc2_param)
+        routed_fc1_init.append(fc1_init)
+        routed_fc2_init.append(fc2_init)
+        cleared.extend((fc1_cleared, fc2_cleared))
+
+    shared = Stub()
+    shared.linear_fc1 = Stub()
+    shared.linear_fc2 = Stub()
+    shared_fc1_init = torch.arange(
+        2 * shared_intermediate * hidden_size, dtype=torch.float32
+    ).reshape(2 * shared_intermediate, hidden_size)
+    shared_fc2_init = torch.arange(hidden_size * shared_intermediate, dtype=torch.float32).reshape(
+        hidden_size, shared_intermediate
+    )
+    shared.linear_fc1.weight, shared_fc1_cleared = _parameter_with_preserved_init(shared_fc1_init)
+    shared.linear_fc2.weight, shared_fc2_cleared = _parameter_with_preserved_init(shared_fc2_init)
+    cleared.extend((shared_fc1_cleared, shared_fc2_cleared))
+
+    module = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
+    torch.nn.Module.__init__(module)
+    module.hidden_size = hidden_size
+    module.intermediate_size = routed_intermediate
+    module.shared_intermediate_size = shared_intermediate
+    module.num_local_experts = num_experts
+    module._debug_module_index = 0
+
+    module._import_routed_weights(routed)
+    module._import_shared_weights(shared)
+
+    expected_routed_gate = torch.stack([value[:routed_intermediate] for value in routed_fc1_init])
+    expected_routed_up = torch.stack([value[routed_intermediate:] for value in routed_fc1_init])
+    expected_routed_down = torch.stack(routed_fc2_init)
+
+    expected_shared_gate = torch.zeros((routed_intermediate, hidden_size))
+    expected_shared_up = torch.zeros_like(expected_shared_gate)
+    expected_shared_down = torch.zeros((hidden_size, routed_intermediate))
+    expected_shared_gate[:shared_intermediate].copy_(shared_fc1_init[:shared_intermediate])
+    expected_shared_up[:shared_intermediate].copy_(shared_fc1_init[shared_intermediate:])
+    expected_shared_down[:, :shared_intermediate].copy_(shared_fc2_init)
+
+    expected_by_param = {
+        module.routed_gate_weight: expected_routed_gate,
+        module.routed_up_weight: expected_routed_up,
+        module.routed_down_weight: expected_routed_down,
+        module.shared_gate_weight: expected_shared_gate,
+        module.shared_up_weight: expected_shared_up,
+        module.shared_down_weight: expected_shared_down,
+    }
+    from megatron.core.optimizer.optimizer import _pop_high_precision_init_val
+
+    for param, expected in expected_by_param.items():
+        torch.testing.assert_close(
+            param.float(), expected.to(torch.bfloat16).float(), rtol=0, atol=0
+        )
+        preserved = _pop_high_precision_init_val(param)
+        torch.testing.assert_close(preserved, expected, rtol=0, atol=0)
+        assert _pop_high_precision_init_val(param) is None
+
+    assert all(item == [True] for item in cleared)

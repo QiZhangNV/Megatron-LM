@@ -7,13 +7,15 @@ expert computation, and combine. Checkpoint conversion remains out of scope.
 """
 
 from __future__ import annotations
-import itertools
 
+import itertools
 from typing import Any, Iterable
 
 import torch
 from torch import nn
+
 _MOK_MODULE_INDICES = itertools.count()
+_MOK_HIGH_PRECISION_INIT_ATTR = "_mok_high_precision_init_val"
 
 
 def _debug_record(
@@ -60,6 +62,28 @@ def _dequantize_bf16(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to(dtype=torch.bfloat16)
 
 
+def _materialize_parameter_init(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Return the logical initialization value and whether TE preserved it losslessly."""
+    get_high_precision_init_val = getattr(tensor, "get_high_precision_init_val", None)
+    if callable(get_high_precision_init_val):
+        init_val = get_high_precision_init_val().detach()
+        tensor.clear_high_precision_init_val()
+        return init_val, True
+    return _dequantize_bf16(tensor), False
+
+
+def _attach_high_precision_init(param: nn.Parameter, init_val: torch.Tensor | None) -> None:
+    """Preserve a reordered pre-quantization init until MCore creates its FP32 master."""
+    if init_val is None:
+        return
+    if init_val.shape != param.shape:
+        raise RuntimeError(
+            "MOK high-precision initialization shape mismatch: "
+            f"init={tuple(init_val.shape)}, param={tuple(param.shape)}"
+        )
+    setattr(param, _MOK_HIGH_PRECISION_INIT_ATTR, init_val.detach().contiguous())
+
+
 def _indexed_grouped_weight(linear: nn.Module, index: int, num_experts: int) -> torch.Tensor:
     """Return one logical expert weight from either TE grouped layout."""
     if not getattr(linear, "single_grouped_weight", False):
@@ -76,7 +100,9 @@ def _indexed_grouped_weight(linear: nn.Module, index: int, num_experts: int) -> 
             f"Cannot split grouped weight with shape {tuple(weight.shape)} "
             f"into {num_experts} experts"
         )
-    return weight.narrow(0, index * (weight.shape[0] // num_experts), weight.shape[0] // num_experts)
+    return weight.narrow(
+        0, index * (weight.shape[0] // num_experts), weight.shape[0] // num_experts
+    )
 
 
 def _new_bf16_parameter(
@@ -165,10 +191,7 @@ class _MoKAutograd(torch.autograd.Function):
             topk=top_experts.shape[1],
         )
         schedule = functional.build_schedule(
-            workspace,
-            module.mok_config,
-            top_experts,
-            num_local_experts=module.num_local_experts,
+            workspace, module.mok_config, top_experts, num_local_experts=module.num_local_experts
         )
         trace_param_lifecycle = module.is_first_microbatch
         if trace_param_lifecycle:
@@ -403,29 +426,57 @@ class MoKMegakernel(nn.Module):
         self.routed_gate_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
         self.routed_up_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
         self.routed_down_weight = _new_bf16_parameter((e, h, i), fc2_ref, allreduce=False)
-        _debug_tag(
-            self.routed_gate_weight,
-            f"module{self._debug_module_index}.routed_gate_weight",
-        )
-        _debug_tag(
-            self.routed_up_weight,
-            f"module{self._debug_module_index}.routed_up_weight",
-        )
-        _debug_tag(
-            self.routed_down_weight,
-            f"module{self._debug_module_index}.routed_down_weight",
-        )
+        _debug_tag(self.routed_gate_weight, f"module{self._debug_module_index}.routed_gate_weight")
+        _debug_tag(self.routed_up_weight, f"module{self._debug_module_index}.routed_up_weight")
+        _debug_tag(self.routed_down_weight, f"module{self._debug_module_index}.routed_down_weight")
+
+        routed_gate_init = None
+        routed_up_init = None
+        routed_down_init = None
+        fc1_has_preserved_init = None
+        fc2_has_preserved_init = None
 
         for expert_idx in range(e):
-            source_fc1 = _dequantize_bf16(
+            source_fc1, current_fc1_has_preserved_init = _materialize_parameter_init(
                 _indexed_grouped_weight(fc1, expert_idx, self.num_local_experts)
-            ).reshape(2 * i, h)
-            source_fc2 = _dequantize_bf16(
+            )
+            source_fc2, current_fc2_has_preserved_init = _materialize_parameter_init(
                 _indexed_grouped_weight(fc2, expert_idx, self.num_local_experts)
-            ).reshape(h, i)
-            self.routed_gate_weight[expert_idx].copy_(source_fc1[:i])
-            self.routed_up_weight[expert_idx].copy_(source_fc1[i:])
-            self.routed_down_weight[expert_idx].copy_(source_fc2)
+            )
+            source_fc1 = source_fc1.reshape(2 * i, h)
+            source_fc2 = source_fc2.reshape(h, i)
+
+            if fc1_has_preserved_init is None:
+                fc1_has_preserved_init = current_fc1_has_preserved_init
+                if fc1_has_preserved_init:
+                    routed_gate_init = torch.empty(
+                        (e, i, h), dtype=source_fc1.dtype, device=source_fc1.device
+                    )
+                    routed_up_init = torch.empty_like(routed_gate_init)
+            elif fc1_has_preserved_init != current_fc1_has_preserved_init:
+                raise RuntimeError("MOK routed FC1 weights have inconsistent initialization state")
+
+            if fc2_has_preserved_init is None:
+                fc2_has_preserved_init = current_fc2_has_preserved_init
+                if fc2_has_preserved_init:
+                    routed_down_init = torch.empty(
+                        (e, h, i), dtype=source_fc2.dtype, device=source_fc2.device
+                    )
+            elif fc2_has_preserved_init != current_fc2_has_preserved_init:
+                raise RuntimeError("MOK routed FC2 weights have inconsistent initialization state")
+
+            self.routed_gate_weight[expert_idx].copy_(source_fc1[:i].to(torch.bfloat16))
+            self.routed_up_weight[expert_idx].copy_(source_fc1[i:].to(torch.bfloat16))
+            self.routed_down_weight[expert_idx].copy_(source_fc2.to(torch.bfloat16))
+            if routed_gate_init is not None:
+                routed_gate_init[expert_idx].copy_(source_fc1[:i])
+                routed_up_init[expert_idx].copy_(source_fc1[i:])
+            if routed_down_init is not None:
+                routed_down_init[expert_idx].copy_(source_fc2)
+
+        _attach_high_precision_init(self.routed_gate_weight, routed_gate_init)
+        _attach_high_precision_init(self.routed_up_weight, routed_up_init)
+        _attach_high_precision_init(self.routed_down_weight, routed_down_init)
 
     @torch.no_grad()
     def _import_shared_weights(self, shared: nn.Module) -> None:
@@ -448,33 +499,42 @@ class MoKMegakernel(nn.Module):
         self.shared_down_weight = _new_bf16_parameter(
             (h, routed_i), fc2_ref, allreduce=True, zero=True
         )
-        _debug_tag(
-            self.shared_gate_weight,
-            f"module{self._debug_module_index}.shared_gate_weight",
-        )
-        _debug_tag(
-            self.shared_up_weight,
-            f"module{self._debug_module_index}.shared_up_weight",
-        )
-        _debug_tag(
-            self.shared_down_weight,
-            f"module{self._debug_module_index}.shared_down_weight",
-        )
-        source_fc1 = _dequantize_bf16(fc1_ref).reshape(2 * shared_i, h)
-        source_fc2 = _dequantize_bf16(fc2_ref).reshape(h, shared_i)
-        self.shared_gate_weight[:shared_i].copy_(source_fc1[:shared_i])
-        self.shared_up_weight[:shared_i].copy_(source_fc1[shared_i:])
-        self.shared_down_weight[:, :shared_i].copy_(source_fc2)
+        _debug_tag(self.shared_gate_weight, f"module{self._debug_module_index}.shared_gate_weight")
+        _debug_tag(self.shared_up_weight, f"module{self._debug_module_index}.shared_up_weight")
+        _debug_tag(self.shared_down_weight, f"module{self._debug_module_index}.shared_down_weight")
+        source_fc1, fc1_has_preserved_init = _materialize_parameter_init(fc1_ref)
+        source_fc2, fc2_has_preserved_init = _materialize_parameter_init(fc2_ref)
+        source_fc1 = source_fc1.reshape(2 * shared_i, h)
+        source_fc2 = source_fc2.reshape(h, shared_i)
+        self.shared_gate_weight[:shared_i].copy_(source_fc1[:shared_i].to(torch.bfloat16))
+        self.shared_up_weight[:shared_i].copy_(source_fc1[shared_i:].to(torch.bfloat16))
+        self.shared_down_weight[:, :shared_i].copy_(source_fc2.to(torch.bfloat16))
+
+        shared_gate_init = None
+        shared_up_init = None
+        shared_down_init = None
+        if fc1_has_preserved_init:
+            shared_gate_init = torch.zeros(
+                (routed_i, h), dtype=source_fc1.dtype, device=source_fc1.device
+            )
+            shared_up_init = torch.zeros_like(shared_gate_init)
+            shared_gate_init[:shared_i].copy_(source_fc1[:shared_i])
+            shared_up_init[:shared_i].copy_(source_fc1[shared_i:])
+        if fc2_has_preserved_init:
+            shared_down_init = torch.zeros(
+                (h, routed_i), dtype=source_fc2.dtype, device=source_fc2.device
+            )
+            shared_down_init[:, :shared_i].copy_(source_fc2)
+
+        _attach_high_precision_init(self.shared_gate_weight, shared_gate_init)
+        _attach_high_precision_init(self.shared_up_weight, shared_up_init)
+        _attach_high_precision_init(self.shared_down_weight, shared_down_init)
 
     @torch.no_grad()
     def quantized_routed_weights(self):
         """Refresh normal+transposed MXFP8 copies once per optimizer iteration."""
         if not self.use_mxfp8_weights:
-            return (
-                self.routed_gate_weight,
-                self.routed_up_weight,
-                self.routed_down_weight,
-            )
+            return (self.routed_gate_weight, self.routed_up_weight, self.routed_down_weight)
 
         from mok.ops import mxfp8_quantize
 
@@ -498,10 +558,7 @@ class MoKMegakernel(nn.Module):
         return self._quantized_cache
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        routing_map: torch.Tensor,
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
         del routing_map  # Router side effects/losses are already attached to probs.
         original_shape = hidden_states.shape
