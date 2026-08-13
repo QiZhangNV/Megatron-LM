@@ -414,17 +414,6 @@ class MoKMegakernel(nn.Module):
         self._import_routed_weights(routed_experts)
         self._import_shared_weights(shared_experts)
 
-        # Routed expert parameter all-gather staging may reuse the FP32 grad
-        # buffer while the model keeps its private BF16 kernel weights. Keep
-        # the opt-in off dense/shared buffers, which contain unrelated params.
-        if config.reuse_grad_buf_for_mxfp8_param_ag:
-            for param in (
-                self.routed_gate_weight,
-                self.routed_up_weight,
-                self.routed_down_weight,
-            ):
-                param._mok_reuse_grad_buf_for_param_ag = True
-
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
         self.is_first_microbatch = True
