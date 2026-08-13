@@ -117,10 +117,15 @@ def _new_bf16_parameter(
 
 
 def _dummy_weight_gradient(param: nn.Parameter) -> torch.Tensor:
-    """Return TE's shared dummy tensor used to trigger MCore DDP hooks."""
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+    """Return a storage-free gradient sentinel used to trigger MCore DDP hooks.
 
-    return get_dummy_wgrad(list(param.shape), param.dtype)
+    MOK has already accumulated the numerical gradient into ``main_grad``. The
+    autograd return only needs the parameter's shape and dtype so that MCore's
+    post-accumulate hook runs; the hook does not read it when
+    ``grad_added_to_main_grad`` is true. A detached parameter view therefore
+    avoids allocating a full-sized dummy gradient.
+    """
+    return param.detach()
 
 
 def _main_grad_buffer(param: nn.Parameter) -> torch.Tensor:

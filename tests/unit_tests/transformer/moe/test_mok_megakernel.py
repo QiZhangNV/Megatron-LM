@@ -13,6 +13,17 @@ def _parameter_with_main_grad(shape=(4, 8)):
     return param
 
 
+def test_dummy_weight_gradient_reuses_parameter_storage():
+    param = _parameter_with_main_grad()
+
+    dummy = mok_megakernel._dummy_weight_gradient(param)
+
+    assert dummy.shape == param.shape
+    assert dummy.dtype == param.dtype
+    assert dummy.data_ptr() == param.data_ptr()
+    assert not dummy.requires_grad
+
+
 def test_accumulate_weight_gradient_adds_to_main_grad_and_returns_dummy(monkeypatch):
     param = _parameter_with_main_grad()
     grad = torch.full_like(param, 0.5)
