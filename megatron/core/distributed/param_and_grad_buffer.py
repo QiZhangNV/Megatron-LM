@@ -1275,9 +1275,12 @@ class _ParamAndGradBuffer:
         self.nccl_mem_pool = None
         shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and (
             any(_param_uses_quantized_storage(p) for p in self.params)
-            or all(
-                getattr(p, "_mok_reuse_grad_buf_for_param_ag", False)
-                for p in self.params
+            or (
+                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and all(
+                    getattr(p, "_mok_reuse_grad_buf_for_param_ag", False)
+                    for p in self.params
+                )
             )
         )
         if (
