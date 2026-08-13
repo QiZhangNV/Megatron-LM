@@ -102,10 +102,8 @@ def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
 
 def _param_uses_reusable_ag_storage(param: torch.nn.Parameter) -> bool:
     """Return whether param AG may temporarily reuse this parameter's grad buffer."""
-    return (
-        _param_uses_quantized_storage(param)
-        or getattr(param, "_mok_reuse_grad_buf_for_param_ag", False)
-        or getattr(param, "_mok_reuse_grad_buf_for_param_ag_buffer", False)
+    return _param_uses_quantized_storage(param) or getattr(
+        param, "_mok_reuse_grad_buf_for_param_ag", False
     )
 
 
@@ -426,7 +424,7 @@ class _ParamAndGradBucketGroup:
                     # mixed buckets because zeroing bucket.param_data would also
                     # clear those model weights.
                     if not _param_uses_quantized_storage(param):
-                        if _param_uses_reusable_ag_storage(param):
+                        if getattr(param, "_mok_reuse_grad_buf_for_param_ag", False):
                             param_start, param_end = bucket.param_to_index[param]
                             param_slice = bucket.param_data.view(-1)[param_start:param_end]
                             param.data.copy_(param_slice.view_as(param))
@@ -1275,19 +1273,15 @@ class _ParamAndGradBuffer:
         self.grad_data = None
         self.extra_main_grads = []
         self.nccl_mem_pool = None
-        reuse_mok_param_ag_buffer = (
-            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-            and any(
-                getattr(p, "_mok_reuse_grad_buf_for_param_ag", False)
-                for p in self.params
-            )
-        )
-        if reuse_mok_param_ag_buffer:
-            for param in self.params:
-                param._mok_reuse_grad_buf_for_param_ag_buffer = True
         shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and (
             any(_param_uses_quantized_storage(p) for p in self.params)
-            or reuse_mok_param_ag_buffer
+            or (
+                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and all(
+                    getattr(p, "_mok_reuse_grad_buf_for_param_ag", False)
+                    for p in self.params
+                )
+            )
         )
         if (
             HAVE_TORCH_MEMORY_SAVER
