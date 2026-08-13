@@ -7,11 +7,34 @@ expert computation, and combine. Checkpoint conversion remains out of scope.
 """
 
 from __future__ import annotations
+import itertools
 
 from typing import Any, Iterable
 
 import torch
 from torch import nn
+_MOK_MODULE_INDICES = itertools.count()
+
+
+def _debug_record(
+    stage: str,
+    param: torch.Tensor,
+    *,
+    tensors: dict[str, torch.Tensor | None] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Record an opt-in lifecycle snapshot without importing debug code normally."""
+    from megatron.core.mok_param_lifecycle_debug import enabled, record
+
+    if enabled():
+        record(stage, param, tensors=tensors, metadata=metadata)
+
+
+def _debug_tag(param: nn.Parameter, name: str) -> None:
+    from megatron.core.mok_param_lifecycle_debug import enabled, tag_parameter
+
+    if enabled():
+        tag_parameter(param, name)
 
 
 def _copy_parameter_attributes(dst: nn.Parameter, src: torch.Tensor, *, allreduce: bool) -> None:
@@ -147,10 +170,28 @@ class _MoKAutograd(torch.autograd.Function):
             top_experts,
             num_local_experts=module.num_local_experts,
         )
+        _debug_record(
+            "forward.after_param_sync_before_quantize",
+            module.routed_gate_weight,
+            tensors={"main_grad": getattr(module.routed_gate_weight, "main_grad", None)},
+        )
         gate_q, up_q, down_q = module.quantized_routed_weights()
         gate_forward = gate_q[:2] if isinstance(gate_q, tuple) else gate_q
         up_forward = up_q[:2] if isinstance(up_q, tuple) else up_q
         down_forward = down_q[:2] if isinstance(down_q, tuple) else down_q
+        if isinstance(gate_q, tuple):
+            _debug_record(
+                "forward.mok_quantized_weight_cache",
+                module.routed_gate_weight,
+                tensors={
+                    "rowwise_data": gate_q[0],
+                    "rowwise_scale": gate_q[1],
+                    "columnwise_data": gate_q[2],
+                    "columnwise_scale": gate_q[3],
+                    "actual_forward_data": gate_forward[0],
+                    "actual_forward_scale": gate_forward[1],
+                },
+            )
         output, forward_context = functional.forward(
             module.mok_config,
             workspace,
@@ -212,6 +253,23 @@ class _MoKAutograd(torch.autograd.Function):
                 _main_grad_buffer(ctx.module.shared_down_weight),
                 _main_grad_buffer(ctx.module.routed_down_weight),
             )
+        backward_debug_tensors = {
+            "main_grad_before": getattr(ctx.module.routed_gate_weight, "main_grad", None)
+        }
+        if isinstance(backward_gate, tuple):
+            backward_debug_tensors.update(
+                {
+                    "actual_backward_rowwise_data": backward_gate[0],
+                    "actual_backward_rowwise_scale": backward_gate[1],
+                    "actual_backward_columnwise_data": backward_gate[2],
+                    "actual_backward_columnwise_scale": backward_gate[3],
+                }
+            )
+        _debug_record(
+            "backward.before_mok_kernel",
+            ctx.module.routed_gate_weight,
+            tensors=backward_debug_tensors,
+        )
         (
             d_x,
             d_router_weights,
@@ -239,6 +297,13 @@ class _MoKAutograd(torch.autograd.Function):
             main_grads=main_grads,
         )
 
+        _debug_record(
+            "backward.after_mok_kernel",
+            ctx.module.routed_gate_weight,
+            tensors={
+                "main_grad_after": getattr(ctx.module.routed_gate_weight, "main_grad", None)
+            },
+        )
         if ctx.module.fuse_wgrad_accumulation:
             d_routed_gate = _finish_weight_gradient(ctx.module.routed_gate_weight)
             d_routed_up = _finish_weight_gradient(ctx.module.routed_up_weight)
@@ -302,6 +367,7 @@ class MoKMegakernel(nn.Module):
         self.swiglu_limit = config.activation_func_clamp_value
         self.use_mxfp8_weights = config.mok_use_mxfp8_weights
         self.fuse_wgrad_accumulation = config.gradient_accumulation_fusion
+        self._debug_module_index = next(_MOK_MODULE_INDICES)
         self.mok_config = MoKConfig(
             fwd_num_comm_sms=config.mok_fwd_num_comm_sms,
             bwd_num_comm_sms=config.mok_bwd_num_comm_sms,
@@ -332,6 +398,18 @@ class MoKMegakernel(nn.Module):
         self.routed_gate_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
         self.routed_up_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
         self.routed_down_weight = _new_bf16_parameter((e, h, i), fc2_ref, allreduce=False)
+        _debug_tag(
+            self.routed_gate_weight,
+            f"module{self._debug_module_index}.routed_gate_weight",
+        )
+        _debug_tag(
+            self.routed_up_weight,
+            f"module{self._debug_module_index}.routed_up_weight",
+        )
+        _debug_tag(
+            self.routed_down_weight,
+            f"module{self._debug_module_index}.routed_down_weight",
+        )
 
         for expert_idx in range(e):
             source_fc1 = _dequantize_bf16(
@@ -364,6 +442,18 @@ class MoKMegakernel(nn.Module):
         )
         self.shared_down_weight = _new_bf16_parameter(
             (h, routed_i), fc2_ref, allreduce=True, zero=True
+        )
+        _debug_tag(
+            self.shared_gate_weight,
+            f"module{self._debug_module_index}.shared_gate_weight",
+        )
+        _debug_tag(
+            self.shared_up_weight,
+            f"module{self._debug_module_index}.shared_up_weight",
+        )
+        _debug_tag(
+            self.shared_down_weight,
+            f"module{self._debug_module_index}.shared_down_weight",
         )
         source_fc1 = _dequantize_bf16(fc1_ref).reshape(2 * shared_i, h)
         source_fc2 = _dequantize_bf16(fc2_ref).reshape(h, shared_i)
