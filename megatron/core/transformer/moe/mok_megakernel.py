@@ -201,9 +201,7 @@ class _MoKAutograd(torch.autograd.Function):
         backward_gate = gate_q
         backward_up = up_q
         backward_down = down_q[2:] if isinstance(down_q, tuple) else down_q
-        direct_wgrad_accumulation = (
-            ctx.module.fuse_wgrad_accumulation and not ctx.module.use_mxfp8_weights
-        )
+        direct_wgrad_accumulation = ctx.module.fuse_wgrad_accumulation
         main_grads = None
         if direct_wgrad_accumulation:
             main_grads = (
@@ -242,17 +240,12 @@ class _MoKAutograd(torch.autograd.Function):
         )
 
         if ctx.module.fuse_wgrad_accumulation:
-            def finalize(param: nn.Parameter, grad: torch.Tensor) -> torch.Tensor:
-                if direct_wgrad_accumulation:
-                    return _finish_weight_gradient(param)
-                return _accumulate_weight_gradient(param, grad)
-
-            d_routed_gate = finalize(ctx.module.routed_gate_weight, d_routed_gate)
-            d_routed_up = finalize(ctx.module.routed_up_weight, d_routed_up)
-            d_routed_down = finalize(ctx.module.routed_down_weight, d_routed_down)
-            d_shared_gate = finalize(ctx.module.shared_gate_weight, d_shared_gate)
-            d_shared_up = finalize(ctx.module.shared_up_weight, d_shared_up)
-            d_shared_down = finalize(ctx.module.shared_down_weight, d_shared_down)
+            d_routed_gate = _finish_weight_gradient(ctx.module.routed_gate_weight)
+            d_routed_up = _finish_weight_gradient(ctx.module.routed_up_weight)
+            d_routed_down = _finish_weight_gradient(ctx.module.routed_down_weight)
+            d_shared_gate = _finish_weight_gradient(ctx.module.shared_gate_weight)
+            d_shared_up = _finish_weight_gradient(ctx.module.shared_up_weight)
+            d_shared_down = _finish_weight_gradient(ctx.module.shared_down_weight)
 
         ctx.module = None
         ctx.workspace = None

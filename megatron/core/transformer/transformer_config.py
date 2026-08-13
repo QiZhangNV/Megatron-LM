@@ -2096,11 +2096,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("use_mok_megakernel does not support latent MoE")
             if not self.gated_linear_unit or self.activation_func != F.silu:
                 raise ValueError("use_mok_megakernel currently requires SwiGLU")
-            if self.gradient_accumulation_fusion and self.mok_use_mxfp8_weights:
-                raise ValueError(
-                    "use_mok_megakernel currently supports gradient accumulation "
-                    "fusion only with BF16 routed weights"
-                )
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
