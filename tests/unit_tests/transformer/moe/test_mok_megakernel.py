@@ -118,6 +118,56 @@ def test_mxfp8_backward_views_keep_native_columnwise_payload_zero_copy():
     assert actual[4] is True
 
 
+def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeypatch):
+    module = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
+    torch.nn.Module.__init__(module)
+    module.use_mxfp8_weights = True
+    module.is_first_microbatch = True
+    module._prepared_routed_weight_cache = None
+    module.routed_fc1_weight = object()
+    module.routed_down_weight = object()
+    module.num_local_experts = 2
+    module.intermediate_size = 128
+    module.hidden_size = 256
+
+    native_calls = []
+    prepare_calls = []
+
+    def fake_native_views(*args, **kwargs):
+        del args, kwargs
+        native_calls.append(True)
+        gate = (object(),)
+        down = (object(),)
+        return gate, gate, down
+
+    def fake_prepare(native, *, rows, columns):
+        prepare_calls.append((rows, columns))
+        return (native[0], object(), object(), object(), True)
+
+    monkeypatch.setattr(
+        mok_megakernel, "_native_single_grouped_weight_views", fake_native_views
+    )
+    monkeypatch.setattr(
+        mok_megakernel, "_mok_mxfp8_backward_weight_views", fake_prepare
+    )
+
+    first = module.quantized_routed_weights()
+    second = module.quantized_routed_weights()
+
+    assert second is first
+    assert first[0] is first[1]
+    assert len(native_calls) == 1
+    assert prepare_calls == [(256, 256), (256, 128)]
+
+    module.is_first_microbatch = True
+    third = module.quantized_routed_weights()
+
+    assert third is not first
+    assert third[0] is third[1]
+    assert len(native_calls) == 2
+    assert prepare_calls == [(256, 256), (256, 128)] * 2
+
+
 def test_native_single_grouped_bf16_views_alias_authoritative_parameters():
     num_experts, intermediate_size, hidden_size = 2, 4, 8
     fc1 = torch.nn.Parameter(
