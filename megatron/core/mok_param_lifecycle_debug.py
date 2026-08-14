@@ -72,15 +72,24 @@ def _tensor_signature(tensor: torch.Tensor) -> dict[str, Any]:
         ).hexdigest()
         numeric = sampled_cpu.float()
 
-    storage_ptr = tensor.untyped_storage().data_ptr()
+    # TE GroupedTensor is a logical wrapper around member row/column backing
+    # tensors and intentionally has no single valid Python storage pointer.
+    try:
+        storage_ptr = tensor.untyped_storage().data_ptr()
+        storage_offset_bytes = tensor.data_ptr() - storage_ptr
+        data_ptr = tensor.data_ptr()
+    except RuntimeError:
+        storage_ptr = None
+        storage_offset_bytes = None
+        data_ptr = None
     return {
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype),
         "device": str(tensor.device),
         "numel": tensor.numel(),
-        "data_ptr": tensor.data_ptr(),
+        "data_ptr": data_ptr,
         "storage_ptr": storage_ptr,
-        "storage_offset_bytes": tensor.data_ptr() - storage_ptr,
+        "storage_offset_bytes": storage_offset_bytes,
         "raw_sample_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "canonical_bf16_sample_sha256": canonical_bf16_sha256,
         "sample_count": sample_count,

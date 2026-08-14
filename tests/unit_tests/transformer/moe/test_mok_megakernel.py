@@ -76,6 +76,75 @@ def test_main_grad_buffer_requires_contiguous_fp32(dtype):
         mok_megakernel._main_grad_buffer(param)
 
 
+def test_swizzle_mxfp8_scale_matches_tcgen05_lane_layout():
+    rows = columns = 128
+    logical = torch.arange(rows * (columns // 32), dtype=torch.int32).to(torch.uint8)
+    logical = logical.reshape(1, rows, columns // 32)
+
+    actual = mok_megakernel._swizzle_mxfp8_scale(
+        logical, rows=rows, columns=columns
+    )
+
+    assert actual.shape == (1, 1, 32, 16)
+    expected = torch.empty_like(actual)
+    for lane in range(32):
+        for row_group in range(4):
+            for column_scale in range(4):
+                expected[0, 0, lane, row_group * 4 + column_scale] = logical[
+                    0, row_group * 32 + lane, column_scale
+                ]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+
+def test_mxfp8_backward_views_keep_native_columnwise_payload_zero_copy():
+    num_experts, rows, columns = 1, 256, 128
+    row_data = torch.empty((num_experts, rows, columns))
+    row_scale = torch.zeros((num_experts, rows, columns // 32), dtype=torch.uint8)
+    column_data = torch.empty_like(row_data)
+    column_scale = torch.zeros(
+        (num_experts, columns, rows // 32), dtype=torch.uint8
+    )
+    native = (row_data, row_scale, column_data, column_scale, True)
+
+    actual = mok_megakernel._mok_mxfp8_backward_weight_views(
+        native,
+        rows=rows,
+        columns=columns,
+    )
+
+    assert actual[0].data_ptr() == row_data.data_ptr()
+    assert actual[2].data_ptr() == column_data.data_ptr()
+    assert actual[4] is True
+
+
+def test_native_single_grouped_bf16_views_alias_authoritative_parameters():
+    num_experts, intermediate_size, hidden_size = 2, 4, 8
+    fc1 = torch.nn.Parameter(
+        torch.randn(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16
+        )
+    )
+    fc2 = torch.nn.Parameter(
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16
+        )
+    )
+
+    gate, up, down = mok_megakernel._native_single_grouped_weight_views(
+        fc1,
+        fc2,
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        use_mxfp8=False,
+    )
+
+    assert gate is fc1
+    assert up is fc1
+    assert down is fc2
+
+
 def _parameter_with_preserved_init(init_val):
     param = torch.nn.Parameter(torch.zeros(init_val.shape, dtype=torch.bfloat16))
     cleared = []

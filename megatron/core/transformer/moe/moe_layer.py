@@ -352,9 +352,9 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
-        # Experimental E2E path: preserve the standard constructors above so RNG
-        # consumption and initial values match MCore, import those values into the
-        # contiguous layouts required by MoK, then unregister the unused modules.
+        # Experimental E2E path: preserve routed experts as the authoritative
+        # optimizer/DDP/checkpoint owner. MOK consumes their native single-grouped
+        # storage directly; only shared experts are imported into MOK-owned params.
         self.mok_experts = None
         if self.config.use_mok_megakernel:
             from megatron.core.transformer.moe.mok_megakernel import MoKMegakernel
@@ -366,7 +366,6 @@ class MoELayer(BaseMoELayer):
                 shared_experts=self.shared_experts,
                 num_local_experts=self.num_local_experts,
             )
-            self.experts = None
             self.shared_experts = None
             self.token_dispatcher = None
 

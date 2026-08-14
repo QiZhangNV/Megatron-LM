@@ -155,6 +155,186 @@ def _finish_weight_gradient(param: nn.Parameter) -> torch.Tensor:
     return _dummy_weight_gradient(param)
 
 
+def _storage_view(
+    storage: torch.Tensor,
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    name: str,
+) -> torch.Tensor:
+    """Return a zero-copy dense view over a TE grouped backing tensor."""
+    if not storage.is_cuda or not storage.is_contiguous():
+        raise RuntimeError(f"MOK {name} storage must be contiguous CUDA storage")
+    if storage.dtype != dtype:
+        if storage.dtype == torch.uint8 and dtype == torch.float8_e4m3fn:
+            storage = storage.view(dtype)
+        else:
+            raise RuntimeError(
+                f"MOK {name} storage has dtype {storage.dtype}, expected {dtype}"
+            )
+    expected_numel = 1
+    for dim in shape:
+        expected_numel *= dim
+    if storage.numel() != expected_numel:
+        raise RuntimeError(
+            f"MOK {name} storage size mismatch: got {storage.numel()}, "
+            f"expected {expected_numel} for {shape}"
+        )
+    return storage.view(shape)
+
+
+def _grouped_mxfp8_scale_view(
+    param: nn.Parameter,
+    member_attr: str,
+    shape: tuple[int, ...],
+    *,
+    name: str,
+) -> torch.Tensor:
+    """Expose all experts' contiguous TE MXFP8 scale storage through member zero."""
+    from megatron.core.fp8_utils import get_grouped_quantized_members
+
+    members = get_grouped_quantized_members(param)
+    if not members:
+        raise RuntimeError(f"MOK {name} grouped parameter has no quantized members")
+    first = getattr(members[0], member_attr, None)
+    if first is None or first.dtype != torch.uint8 or not first.is_contiguous():
+        raise RuntimeError(
+            f"MOK {name} requires contiguous uint8 TE member storage {member_attr}"
+        )
+    expected_numel = 1
+    for dim in shape:
+        expected_numel *= dim
+    storage_numel = first.untyped_storage().nbytes() // first.element_size()
+    available_numel = storage_numel - first.storage_offset()
+    if available_numel < expected_numel:
+        raise RuntimeError(
+            f"MOK {name} scale storage is too small: available={available_numel}, "
+            f"expected={expected_numel}"
+        )
+    flat = torch.as_strided(
+        first,
+        (expected_numel,),
+        (1,),
+        storage_offset=first.storage_offset(),
+    )
+    return flat.view(shape)
+
+
+def _swizzle_mxfp8_scale(
+    logical_scale: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> torch.Tensor:
+    """Convert TE's logical E8M0 matrix to MOK's tcgen05 scale layout.
+
+    TE stores rowwise scales as ``[E, M, K / 32]``. MOK consumes the
+    tcgen05 1x scale-factor layout ``[E * M / 128, K / 128, 32, 16]``.
+    Only the scale bytes are copied; the much larger FP8 payload stays in
+    native TE storage.
+    """
+    if rows % 128 != 0 or columns % 128 != 0:
+        raise RuntimeError("MOK MXFP8 scale dimensions must be divisible by 128")
+    if logical_scale.dtype != torch.uint8 or logical_scale.ndim != 3:
+        raise RuntimeError("MOK requires logical uint8 MXFP8 scales shaped [E, M, K/32]")
+    num_experts = logical_scale.shape[0]
+    expected_shape = (num_experts, rows, columns // 32)
+    if tuple(logical_scale.shape) != expected_shape:
+        raise RuntimeError(
+            f"MOK logical scale shape mismatch: got {tuple(logical_scale.shape)}, "
+            f"expected {expected_shape}"
+        )
+    return (
+        logical_scale.reshape(
+            num_experts, rows // 128, 128, columns // 128, 4
+        )
+        .permute(0, 1, 3, 2, 4)
+        .reshape(num_experts, rows // 128, columns // 128, 4, 32, 4)
+        .transpose(-3, -2)
+        .reshape(num_experts * rows // 128, columns // 128, 32, 16)
+        .contiguous()
+    )
+
+
+def _native_single_grouped_weight_views(
+    fc1: nn.Parameter,
+    fc2: nn.Parameter,
+    *,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+    use_mxfp8: bool,
+):
+    """Build MOK gate/up/down views directly over native TE grouped parameters."""
+    e, i, h = num_experts, intermediate_size, hidden_size
+    if tuple(fc1.shape) != (e, 2 * i, h) or tuple(fc2.shape) != (e, h, i):
+        raise RuntimeError(
+            "MOK requires native single-grouped FC1/FC2 shapes "
+            f"{(e, 2 * i, h)} and {(e, h, i)}, got "
+            f"{tuple(fc1.shape)} and {tuple(fc2.shape)}"
+        )
+
+    if not use_mxfp8:
+        if fc1.dtype != torch.bfloat16 or fc2.dtype != torch.bfloat16:
+            raise RuntimeError("MOK BF16 requires native BF16 grouped parameters")
+        if not fc1.is_contiguous() or not fc2.is_contiguous():
+            raise RuntimeError("MOK BF16 requires contiguous grouped parameters")
+        return fc1, fc1, fc2
+
+    from megatron.core.fp8_utils import is_grouped_mxfp8tensor
+
+    if not is_grouped_mxfp8tensor(fc1) or not is_grouped_mxfp8tensor(fc2):
+        raise RuntimeError("MOK MXFP8 requires native TE grouped MXFP8 parameters")
+
+    fc1_row = _storage_view(
+        fc1.rowwise_data, (e, 2 * i, h), dtype=torch.float8_e4m3fn, name="FC1 rowwise"
+    )
+    fc1_col = _storage_view(
+        fc1.columnwise_data,
+        (e, 2 * i, h),
+        dtype=torch.float8_e4m3fn,
+        name="FC1 columnwise",
+    )
+    fc2_row = _storage_view(
+        fc2.rowwise_data, (e, h, i), dtype=torch.float8_e4m3fn, name="FC2 rowwise"
+    )
+    fc2_col = _storage_view(
+        fc2.columnwise_data,
+        (e, h, i),
+        dtype=torch.float8_e4m3fn,
+        name="FC2 columnwise",
+    )
+    # TE keeps E8M0 scales in logical order. Rowwise member storage is
+    # [M, K/32]; columnwise member storage is [M/32, K] for the original
+    # matrix, so transpose the latter into logical order for the transposed
+    # FP8 payload. These are all zero-copy views.
+    fc1_row_sc = _grouped_mxfp8_scale_view(
+        fc1, "_rowwise_scale_inv", (e, 2 * i, h // 32), name="FC1 rowwise"
+    )
+    fc1_col_sc = _grouped_mxfp8_scale_view(
+        fc1,
+        "_columnwise_scale_inv",
+        (e, 2 * i // 32, h),
+        name="FC1 columnwise",
+    ).transpose(-2, -1)
+    fc2_row_sc = _grouped_mxfp8_scale_view(
+        fc2, "_rowwise_scale_inv", (e, h, i // 32), name="FC2 rowwise"
+    )
+    fc2_col_sc = _grouped_mxfp8_scale_view(
+        fc2,
+        "_columnwise_scale_inv",
+        (e, h // 32, i),
+        name="FC2 columnwise",
+    ).transpose(-2, -1)
+    # The final flag tells MOK that ``columnwise_data`` is TE's native
+    # columnwise-quantized storage in the original [E, M, K] tensor shape.
+    # MOK can then consume it directly for dgrad instead of materializing an
+    # explicit [E, K, M] transpose on every backward.
+    fc1_views = (fc1_row, fc1_row_sc, fc1_col, fc1_col_sc, True)
+    fc2_views = (fc2_row, fc2_row_sc, fc2_col, fc2_col_sc, True)
+    return fc1_views, fc1_views, fc2_views
+
+
 @torch.no_grad()
 def _accumulate_weight_gradient(param: nn.Parameter, grad: torch.Tensor) -> torch.Tensor:
     """Accumulate a materialized wgrad; fallback for non-fused MOK precisions."""
@@ -167,6 +347,34 @@ def _accumulate_weight_gradient(param: nn.Parameter, grad: torch.Tensor) -> torc
     main_grad.add_(grad)
     return _finish_weight_gradient(param)
 
+def _mok_mxfp8_forward_weight_views(
+    native_weight: tuple[torch.Tensor, ...],
+    *,
+    rows: int,
+    columns: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare only the rowwise payload and transient scale needed by forward."""
+    row_data, row_scale = native_weight[:2]
+    return row_data, _swizzle_mxfp8_scale(row_scale, rows=rows, columns=columns)
+
+
+def _mok_mxfp8_backward_weight_views(
+    native_weight: tuple[torch.Tensor, ...],
+    *,
+    rows: int,
+    columns: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Prepare zero-copy payloads and transient scales for backward."""
+    row_data, row_scale, column_data, column_scale, native_columnwise = native_weight
+    if native_columnwise is not True:
+        raise RuntimeError("MOK MCore integration requires native TE columnwise weights")
+    return (
+        row_data,
+        _swizzle_mxfp8_scale(row_scale, rows=rows, columns=columns),
+        column_data,
+        _swizzle_mxfp8_scale(column_scale, rows=columns, columns=rows),
+        True,
+    )
 
 class _MoKAutograd(torch.autograd.Function):
     """Autograd bridge from MCore parameters to MoK's functional API."""
@@ -178,8 +386,7 @@ class _MoKAutograd(torch.autograd.Function):
         x: torch.Tensor,
         router_weights: torch.Tensor,
         top_experts: torch.Tensor,
-        routed_gate: torch.Tensor,
-        routed_up: torch.Tensor,
+        routed_fc1: torch.Tensor,
         routed_down: torch.Tensor,
         shared_gate: torch.Tensor,
         shared_up: torch.Tensor,
@@ -202,22 +409,32 @@ class _MoKAutograd(torch.autograd.Function):
         if trace_param_lifecycle:
             _debug_record(
                 "forward.after_param_sync_before_quantize",
-                module.routed_gate_weight,
-                tensors={"main_grad": getattr(module.routed_gate_weight, "main_grad", None)},
+                module.routed_fc1_weight,
+                tensors={"main_grad": getattr(module.routed_fc1_weight, "main_grad", None)},
             )
-        gate_q, up_q, down_q = module.quantized_routed_weights()
-        gate_forward = gate_q[:2] if isinstance(gate_q, tuple) else gate_q
-        up_forward = up_q[:2] if isinstance(up_q, tuple) else up_q
-        down_forward = down_q[:2] if isinstance(down_q, tuple) else down_q
-        if trace_param_lifecycle and isinstance(gate_q, tuple):
+        native_gate, native_up, native_down = module.quantized_routed_weights()
+        if module.use_mxfp8_weights:
+            gate_forward = _mok_mxfp8_forward_weight_views(
+                native_gate, rows=2 * module.intermediate_size, columns=module.hidden_size
+            )
+            # Gate/up are two logical halves of exactly the same native FC1.
+            up_forward = gate_forward
+            down_forward = _mok_mxfp8_forward_weight_views(
+                native_down, rows=module.hidden_size, columns=module.intermediate_size
+            )
+        else:
+            gate_forward = native_gate
+            up_forward = native_up
+            down_forward = native_down
+        if trace_param_lifecycle and module.use_mxfp8_weights:
             _debug_record(
                 "forward.mok_quantized_weight_cache",
-                module.routed_gate_weight,
+                module.routed_fc1_weight,
                 tensors={
-                    "rowwise_data": gate_q[0],
-                    "rowwise_scale": gate_q[1],
-                    "columnwise_data": gate_q[2],
-                    "columnwise_scale": gate_q[3],
+                    "native_rowwise_data": native_gate[0],
+                    "native_rowwise_scale": native_gate[1],
+                    "native_columnwise_data": native_gate[2],
+                    "native_columnwise_scale": native_gate[3],
                     "actual_forward_data": gate_forward[0],
                     "actual_forward_scale": gate_forward[1],
                 },
@@ -241,13 +458,12 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.workspace = workspace
         ctx.schedule = schedule
         ctx.forward_context = forward_context
-        ctx.quantized_weights = (gate_q, up_q, down_q)
+        ctx.quantized_weights = (native_gate, native_up, native_down)
         ctx.trace_param_lifecycle = trace_param_lifecycle
         ctx.save_for_backward(
             x,
             router_weights,
-            routed_gate,
-            routed_up,
+            routed_fc1,
             routed_down,
             shared_gate,
             shared_up,
@@ -262,31 +478,48 @@ class _MoKAutograd(torch.autograd.Function):
         (
             x,
             router_weights,
-            routed_gate,
-            routed_up,
+            routed_fc1,
             routed_down,
             shared_gate,
             shared_up,
             shared_down,
         ) = ctx.saved_tensors
-        gate_q, up_q, down_q = ctx.quantized_weights
-        backward_gate = gate_q
-        backward_up = up_q
-        backward_down = down_q[2:] if isinstance(down_q, tuple) else down_q
+        native_gate, native_up, native_down = ctx.quantized_weights
+        if ctx.module.use_mxfp8_weights:
+            backward_gate = _mok_mxfp8_backward_weight_views(
+                native_gate,
+                rows=2 * ctx.module.intermediate_size,
+                columns=ctx.module.hidden_size,
+            )
+            backward_up = backward_gate
+            down_backward_full = _mok_mxfp8_backward_weight_views(
+                native_down,
+                rows=ctx.module.hidden_size,
+                columns=ctx.module.intermediate_size,
+            )
+            backward_down = (
+                down_backward_full[2],
+                down_backward_full[3],
+                down_backward_full[4],
+            )
+        else:
+            backward_gate = native_gate
+            backward_up = native_up
+            backward_down = native_down
         direct_wgrad_accumulation = ctx.module.fuse_wgrad_accumulation
         main_grads = None
         if direct_wgrad_accumulation:
             main_grads = (
                 _main_grad_buffer(ctx.module.shared_gate_weight),
-                _main_grad_buffer(ctx.module.routed_gate_weight),
+                _main_grad_buffer(ctx.module.routed_fc1_weight),
                 _main_grad_buffer(ctx.module.shared_up_weight),
-                _main_grad_buffer(ctx.module.routed_up_weight),
+                _main_grad_buffer(ctx.module.routed_fc1_weight),
                 _main_grad_buffer(ctx.module.shared_down_weight),
                 _main_grad_buffer(ctx.module.routed_down_weight),
             )
         if ctx.trace_param_lifecycle:
             backward_debug_tensors = {
-                "main_grad_before": getattr(ctx.module.routed_gate_weight, "main_grad", None)
+                "main_grad_before": getattr(ctx.module.routed_fc1_weight, "main_grad", None)
             }
             if isinstance(backward_gate, tuple):
                 backward_debug_tensors.update(
@@ -299,14 +532,14 @@ class _MoKAutograd(torch.autograd.Function):
                 )
             _debug_record(
                 "backward.before_mok_kernel",
-                ctx.module.routed_gate_weight,
+                ctx.module.routed_fc1_weight,
                 tensors=backward_debug_tensors,
             )
         (
             d_x,
             d_router_weights,
-            d_routed_gate,
-            d_routed_up,
+            _d_routed_gate,
+            _d_routed_up,
             d_routed_down,
             d_shared_gate,
             d_shared_up,
@@ -332,14 +565,13 @@ class _MoKAutograd(torch.autograd.Function):
         if ctx.trace_param_lifecycle:
             _debug_record(
                 "backward.after_mok_kernel",
-                ctx.module.routed_gate_weight,
+                ctx.module.routed_fc1_weight,
                 tensors={
-                    "main_grad_after": getattr(ctx.module.routed_gate_weight, "main_grad", None)
+                    "main_grad_after": getattr(ctx.module.routed_fc1_weight, "main_grad", None)
                 },
             )
         if ctx.module.fuse_wgrad_accumulation:
-            d_routed_gate = _finish_weight_gradient(ctx.module.routed_gate_weight)
-            d_routed_up = _finish_weight_gradient(ctx.module.routed_up_weight)
+            d_routed_fc1 = _finish_weight_gradient(ctx.module.routed_fc1_weight)
             d_routed_down = _finish_weight_gradient(ctx.module.routed_down_weight)
             d_shared_gate = _finish_weight_gradient(ctx.module.shared_gate_weight)
             d_shared_up = _finish_weight_gradient(ctx.module.shared_up_weight)
@@ -355,8 +587,7 @@ class _MoKAutograd(torch.autograd.Function):
             d_x,
             d_router_weights,
             None,
-            d_routed_gate,
-            d_routed_up,
+            d_routed_fc1,
             d_routed_down,
             d_shared_gate,
             d_shared_up,
@@ -384,6 +615,12 @@ class MoKMegakernel(nn.Module):
                 "on PYTHONPATH"
             ) from exc
 
+        if not config.moe_single_grouped_weight:
+            raise ValueError("MOK integration requires moe_single_grouped_weight=True")
+        if not config.gradient_accumulation_fusion:
+            raise ValueError(
+                "MOK native grouped weights require gradient_accumulation_fusion=True"
+            )
         if config.moe_mlp_glu_interleave_size is not None:
             raise ValueError("MoK weight import requires non-interleaved MCore routed FC1 weights")
         if config.moe_shared_expert_glu_interleave_size is not None:
@@ -411,14 +648,24 @@ class MoKMegakernel(nn.Module):
             scale_router_before_fc2=config.mok_scale_router_before_fc2,
         )
 
-        self._import_routed_weights(routed_experts)
+        fc1 = routed_experts.linear_fc1
+        fc2 = routed_experts.linear_fc2
+        if not getattr(fc1, "single_grouped_weight", False) or not getattr(
+            fc2, "single_grouped_weight", False
+        ):
+            raise ValueError("MOK requires single-grouped weights for routed FC1 and FC2")
+        # Register aliases of the same Parameter objects so DDP's MOK forward
+        # pre-hook waits for their overlap-param-gather buckets. named_parameters
+        # deduplicates them; no additional payload storage is allocated.
+        self.register_parameter("routed_fc1_weight", fc1.weight)
+        self.register_parameter("routed_down_weight", fc2.weight)
+        _debug_tag(self.routed_fc1_weight, f"module{self._debug_module_index}.routed_fc1_weight")
+        _debug_tag(self.routed_down_weight, f"module{self._debug_module_index}.routed_down_weight")
         self._import_shared_weights(shared_experts)
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
         self.is_first_microbatch = True
-        self._quantized_cache: tuple[Any, Any, Any] | None = None
-        self._quantized_versions: tuple[int, int, int] | None = None
 
     @torch.no_grad()
     def _import_routed_weights(self, experts: nn.Module) -> None:
@@ -537,30 +784,15 @@ class MoKMegakernel(nn.Module):
 
     @torch.no_grad()
     def quantized_routed_weights(self):
-        """Refresh normal+transposed MXFP8 copies once per optimizer iteration."""
-        if not self.use_mxfp8_weights:
-            return (self.routed_gate_weight, self.routed_up_weight, self.routed_down_weight)
-
-        from mok.ops import mxfp8_quantize
-
-        versions = (
-            self.routed_gate_weight._version,
-            self.routed_up_weight._version,
-            self.routed_down_weight._version,
+        """Expose native TE grouped parameter storage in MOK's logical views."""
+        self.is_first_microbatch = False
+        return _native_single_grouped_weight_views(
+            self.routed_fc1_weight, self.routed_down_weight,
+            num_experts=self.num_local_experts,
+            intermediate_size=self.intermediate_size,
+            hidden_size=self.hidden_size,
+            use_mxfp8=self.use_mxfp8_weights,
         )
-        if (
-            self._quantized_cache is None
-            or self.is_first_microbatch
-            or versions != self._quantized_versions
-        ):
-            self._quantized_cache = (
-                mxfp8_quantize(self.routed_gate_weight, True, True),
-                mxfp8_quantize(self.routed_up_weight, True, True),
-                mxfp8_quantize(self.routed_down_weight, True, True),
-            )
-            self._quantized_versions = versions
-            self.is_first_microbatch = False
-        return self._quantized_cache
 
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
@@ -579,8 +811,7 @@ class MoKMegakernel(nn.Module):
             x,
             router_weights,
             top_experts,
-            self.routed_gate_weight,
-            self.routed_up_weight,
+            self.routed_fc1_weight,
             self.routed_down_weight,
             self.shared_gate_weight,
             self.shared_up_weight,
