@@ -2080,11 +2080,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.use_mok_megakernel:
-            if not self.moe_single_grouped_weight:
-                raise ValueError(
-                    "use_mok_megakernel currently requires moe_single_grouped_weight=True"
-                )
-            if not self.gradient_accumulation_fusion:
+            if self.moe_single_grouped_weight and not self.gradient_accumulation_fusion:
                 raise ValueError(
                     "use_mok_megakernel with native grouped weights requires "
                     "gradient_accumulation_fusion=True"

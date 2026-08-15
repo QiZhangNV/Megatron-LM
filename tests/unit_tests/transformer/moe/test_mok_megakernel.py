@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import sys
+import types
+
 import pytest
 import torch
 
@@ -11,6 +14,21 @@ def _parameter_with_main_grad(shape=(4, 8)):
     param.main_grad = torch.zeros(shape, dtype=torch.float32)
     param.grad_added_to_main_grad = False
     return param
+
+
+def test_mxfp8_compatibility_warning_is_emitted_once(monkeypatch, capsys):
+    monkeypatch.setattr(
+        mok_megakernel, "_MOK_MXFP8_COMPAT_WARNING_EMITTED", False
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    mok_megakernel._warn_mxfp8_compatibility_fallback()
+    mok_megakernel._warn_mxfp8_compatibility_fallback()
+
+    output = capsys.readouterr().out
+    assert output.count("WARNING: MOK MXFP8") == 1
+    assert "other eligible TE parameters retain" in output
+    assert "substantially more GPU memory" in output
 
 
 def test_dummy_weight_gradient_reuses_parameter_storage():
@@ -121,6 +139,7 @@ def test_mxfp8_backward_views_keep_native_columnwise_payload_zero_copy():
 def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeypatch):
     module = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
     torch.nn.Module.__init__(module)
+    module.native_single_grouped_weights = True
     module.use_mxfp8_weights = True
     module.is_first_microbatch = True
     module._prepared_routed_weight_cache = None
@@ -168,6 +187,74 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     assert prepare_calls == [(256, 256), (256, 128)] * 2
 
 
+def _compatibility_module(*, use_mxfp8_weights):
+    module = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
+    torch.nn.Module.__init__(module)
+    module.native_single_grouped_weights = False
+    module.use_mxfp8_weights = use_mxfp8_weights
+    module.is_first_microbatch = True
+    module._quantized_cache = None
+    module._quantized_versions = None
+    module.routed_gate_weight = torch.nn.Parameter(
+        torch.randn((2, 4, 8), dtype=torch.bfloat16)
+    )
+    module.routed_up_weight = torch.nn.Parameter(
+        torch.randn((2, 4, 8), dtype=torch.bfloat16)
+    )
+    module.routed_down_weight = torch.nn.Parameter(
+        torch.randn((2, 8, 4), dtype=torch.bfloat16)
+    )
+    return module
+
+
+def test_bf16_compatibility_weights_are_zero_copy_and_separate():
+    module = _compatibility_module(use_mxfp8_weights=False)
+
+    gate, up, down = module.quantized_routed_weights()
+
+    assert gate is module.routed_gate_weight
+    assert up is module.routed_up_weight
+    assert down is module.routed_down_weight
+    assert gate.data_ptr() != up.data_ptr()
+    assert not module.is_first_microbatch
+
+
+def test_mxfp8_compatibility_cache_refreshes_per_optimizer_iteration(monkeypatch):
+    module = _compatibility_module(use_mxfp8_weights=True)
+    quantize_calls = []
+
+    def fake_quantize(weight, rowwise, columnwise):
+        assert rowwise and columnwise
+        quantize_calls.append(weight)
+        return (weight, object(), object(), object())
+
+    fake_mok = types.ModuleType("mok")
+    fake_mok.__path__ = []
+    fake_ops = types.ModuleType("mok.ops")
+    fake_ops.mxfp8_quantize = fake_quantize
+    monkeypatch.setitem(sys.modules, "mok", fake_mok)
+    monkeypatch.setitem(sys.modules, "mok.ops", fake_ops)
+
+    first = module.quantized_routed_weights()
+    second = module.quantized_routed_weights()
+
+    assert second is first
+    assert len(quantize_calls) == 3
+
+    module.is_first_microbatch = True
+    third = module.quantized_routed_weights()
+
+    assert third is not first
+    assert len(quantize_calls) == 6
+
+    with torch.no_grad():
+        module.routed_gate_weight.add_(1)
+    fourth = module.quantized_routed_weights()
+
+    assert fourth is not third
+    assert len(quantize_calls) == 9
+
+
 def test_native_single_grouped_bf16_views_alias_authoritative_parameters():
     num_experts, intermediate_size, hidden_size = 2, 4, 8
     fc1 = torch.nn.Parameter(
@@ -193,6 +280,46 @@ def test_native_single_grouped_bf16_views_alias_authoritative_parameters():
     assert gate is fc1
     assert up is fc1
     assert down is fc2
+
+
+def test_native_single_grouped_bf16_views_use_rowwise_storage(monkeypatch):
+    num_experts, intermediate_size, hidden_size = 2, 4, 8
+    fc1 = torch.nn.Parameter(
+        torch.randn(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16
+        )
+    )
+    fc2 = torch.nn.Parameter(
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16
+        )
+    )
+    fc1.rowwise_data = torch.empty_like(fc1)
+    fc2.rowwise_data = torch.empty_like(fc2)
+    storage_calls = []
+
+    def fake_storage_view(storage, shape, *, dtype, name):
+        storage_calls.append((storage, shape, dtype, name))
+        return storage.view(shape)
+
+    monkeypatch.setattr(mok_megakernel, "_storage_view", fake_storage_view)
+
+    gate, up, down = mok_megakernel._native_single_grouped_weight_views(
+        fc1,
+        fc2,
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        use_mxfp8=False,
+    )
+
+    assert gate.data_ptr() == fc1.rowwise_data.data_ptr()
+    assert up.data_ptr() == gate.data_ptr()
+    assert down.data_ptr() == fc2.rowwise_data.data_ptr()
+    assert [call[1] for call in storage_calls] == [
+        (num_experts, 2 * intermediate_size, hidden_size),
+        (num_experts, hidden_size, intermediate_size),
+    ]
 
 
 def _parameter_with_preserved_init(init_val):
