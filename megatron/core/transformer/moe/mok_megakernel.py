@@ -149,7 +149,7 @@ def _dummy_weight_gradient(param: nn.Parameter) -> torch.Tensor:
 
 
 def _main_grad_buffer(param: nn.Parameter) -> torch.Tensor:
-    """Return and validate the optimizer-visible FP32 gradient buffer."""
+    """Return and validate the optimizer-visible FP32 or BF16 gradient buffer."""
     main_grad = getattr(param, "main_grad", None)
     if main_grad is None:
         raise RuntimeError(
@@ -160,8 +160,10 @@ def _main_grad_buffer(param: nn.Parameter) -> torch.Tensor:
             "MOK weight-gradient shape mismatch: "
             f"main_grad={tuple(main_grad.shape)}, param={tuple(param.shape)}"
         )
-    if main_grad.dtype != torch.float32 or not main_grad.is_contiguous():
-        raise RuntimeError("MOK direct accumulation requires contiguous FP32 main_grad")
+    if main_grad.dtype not in (torch.float32, torch.bfloat16):
+        raise RuntimeError("MOK direct accumulation requires FP32 or BF16 main_grad")
+    if not main_grad.is_contiguous():
+        raise RuntimeError("MOK direct accumulation requires contiguous main_grad")
     if getattr(param, "zero_out_wgrad", False):
         raise RuntimeError("MOK does not support zero_out_wgrad parameters")
     if main_grad.device != param.device:

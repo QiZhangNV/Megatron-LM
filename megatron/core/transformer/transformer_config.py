@@ -772,7 +772,7 @@ class TransformerConfig(ModelParallelConfig):
     """Experimental: replace MoE dispatch, routed/shared expert MLPs, and combine with
     the external Mixture-of-Kittens megakernel. MCore still owns routing and trainable
     parameters. This path currently requires TP=1 and a shared expert. Routed weights may
-    use BF16 or MXFP8; fused gradient accumulation is currently BF16-only."""
+    use BF16 or MXFP8; fused gradient accumulation supports FP32 and BF16 main gradients."""
 
     mok_fwd_num_comm_sms: int = 40
     """Number of communication SMs used by the MoK forward megakernel."""

@@ -85,12 +85,20 @@ def test_finish_weight_gradient_marks_ready_without_accumulating(monkeypatch):
     assert param.grad_added_to_main_grad
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
-def test_main_grad_buffer_requires_contiguous_fp32(dtype):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_main_grad_buffer_accepts_supported_dtype(dtype):
     param = torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))
     param.main_grad = torch.zeros((4, 8), dtype=dtype)
 
-    with pytest.raises(RuntimeError, match="contiguous FP32"):
+    assert mok_megakernel._main_grad_buffer(param) is param.main_grad
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
+def test_main_grad_buffer_rejects_unsupported_dtype(dtype):
+    param = torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))
+    param.main_grad = torch.zeros((4, 8), dtype=dtype)
+
+    with pytest.raises(RuntimeError, match="FP32 or BF16"):
         mok_megakernel._main_grad_buffer(param)
 
 
