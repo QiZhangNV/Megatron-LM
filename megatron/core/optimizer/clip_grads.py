@@ -52,6 +52,34 @@ from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 
+_MAX_MULTI_TENSOR_L2_NORM_NUMEL = (1 << 31) - 1
+_MAX_MULTI_TENSOR_L2_NORM_TENSORS = 32
+
+
+def _split_grads_for_l2_norm(grads: List[torch.Tensor]) -> List[List[torch.Tensor]]:
+    """Bound the indexing domain of each fused multi-tensor norm launch.
+
+    Transformer Engine's fused norm can fail when one launch spans many very
+    large flat-buffer views. Preserve the original single launch for ordinary
+    lists. For oversized lists, use one tensor view per launch; an individually
+    oversized tensor is represented by zero-copy contiguous slices.
+    """
+    if (
+        len(grads) <= _MAX_MULTI_TENSOR_L2_NORM_TENSORS
+        and sum(grad.numel() for grad in grads) <= _MAX_MULTI_TENSOR_L2_NORM_NUMEL
+    ):
+        return [grads]
+
+    batches: List[List[torch.Tensor]] = []
+    for grad in grads:
+        views = [grad]
+        if grad.numel() > _MAX_MULTI_TENSOR_L2_NORM_NUMEL:
+            flat_grad = grad.view(-1)
+            views = list(flat_grad.split(_MAX_MULTI_TENSOR_L2_NORM_NUMEL))
+        batches.extend([view] for view in views)
+    return batches
+
+
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
@@ -111,12 +139,22 @@ def get_grad_norm_fp32(
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
             if grads_for_norm:
-                grad_norm, _ = multi_tensor_applier(
-                    l2_norm_impl,
-                    dummy_overflow_buf,
-                    [grads_for_norm],
-                    False,  # no per-parameter norm
-                )
+                grad_batches = _split_grads_for_l2_norm(grads_for_norm)
+                if len(grad_batches) == 1:
+                    grad_norm, _ = multi_tensor_applier(
+                        l2_norm_impl, dummy_overflow_buf, grad_batches, False
+                    )
+                else:
+                    grad_norm_squared = torch.zeros(1, dtype=torch.float, device='cuda')
+                    for grad_batch in grad_batches:
+                        batch_norm, _ = multi_tensor_applier(
+                            l2_norm_impl,
+                            dummy_overflow_buf,
+                            [grad_batch],
+                            False,  # no per-parameter norm
+                        )
+                        grad_norm_squared.add_(batch_norm.float().square())
+                    grad_norm = grad_norm_squared.sqrt()
             else:
                 grad_norm = torch.zeros(1, dtype=torch.float, device='cuda')
             # Since we will be summing across data parallel groups,

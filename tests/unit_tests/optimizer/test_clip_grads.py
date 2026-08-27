@@ -3,7 +3,37 @@
 import torch
 
 from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.optimizer import clip_grads
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+
+
+def test_split_grads_for_l2_norm_bounds_each_launch(monkeypatch):
+    """Large gradient lists are split by both tensor count and indexing range."""
+    monkeypatch.setattr(clip_grads, '_MAX_MULTI_TENSOR_L2_NORM_NUMEL', 8)
+    monkeypatch.setattr(clip_grads, '_MAX_MULTI_TENSOR_L2_NORM_TENSORS', 2)
+
+    grads = [torch.arange(size) for size in (3, 4, 2, 9)]
+    batches = clip_grads._split_grads_for_l2_norm(grads)
+
+    assert [[tensor.numel() for tensor in batch] for batch in batches] == [
+        [3],
+        [4],
+        [2],
+        [8],
+        [1],
+    ]
+    assert all(len(batch) == 1 for batch in batches)
+    assert all(sum(tensor.numel() for tensor in batch) <= 8 for batch in batches)
+
+
+def test_split_grads_for_l2_norm_preserves_ordinary_launch():
+    """Ordinary gradient lists retain the existing one-launch behavior."""
+    grads = [torch.arange(size) for size in (3, 4)]
+
+    batches = clip_grads._split_grads_for_l2_norm(grads)
+
+    assert len(batches) == 1
+    assert batches[0] is grads
 
 
 def test_grad_norm_skip_threshold_config():
