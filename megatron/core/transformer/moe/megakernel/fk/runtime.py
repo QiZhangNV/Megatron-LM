@@ -98,6 +98,7 @@ class FkForwardContext:
     route_index: torch.Tensor
     fc1_x_data: torch.Tensor
     fc1_x_scale: torch.Tensor
+    fc1_x_metadata: torch.Tensor | None
 
 
 _SYSTEM_DEPS: _SystemDependencies | None = None
@@ -368,6 +369,24 @@ class FkRuntime:
             "FK_MCORE_DEBUG "
             f"rank={self.ep_rank} forward_call={self._forward_calls} "
             f"backward_call={self._backward_calls} event={event}",
+            flush=True,
+        )
+
+    def _debug_fc1_wgrad_alignment(self, context: FkForwardContext) -> None:
+        """Report whether forward FC1 inputs match backward dGLU pool rows."""
+        if not self._debug_enabled or context.fc1_x_metadata is None:
+            return
+        backward_metadata = self._workspace_view(
+            self.backward_runner, "token_src_metadata", torch.int64
+        )[: self.local_capacity]
+        positional_matches = backward_metadata == context.fc1_x_metadata
+        print(
+            "FK_MCORE_ALIGNMENT "
+            f"rank={self.ep_rank} forward_call={self._forward_calls} "
+            f"backward_call={self._backward_calls} "
+            f"matched_rows={int(positional_matches.sum().item())} "
+            f"total_rows={self.local_capacity} "
+            f"match_fraction={float(positional_matches.float().mean().item()):.6f}",
             flush=True,
         )
 
@@ -729,6 +748,11 @@ class FkRuntime:
         fc1_x_scale = self.forward_runner.col_quant_sf.view(torch.uint8)[
             :sf_count
         ].clone()
+        fc1_x_metadata = None
+        if self._debug_enabled:
+            fc1_x_metadata = self._workspace_view(
+                self.forward_runner, "token_src_metadata", torch.int64
+            )[: self.local_capacity].clone()
         context = FkForwardContext(
             original_tokens=routes.original_tokens,
             router_weights=routes.router_weights,
@@ -738,6 +762,7 @@ class FkRuntime:
             route_index=route_index,
             fc1_x_data=fc1_x_data,
             fc1_x_scale=fc1_x_scale,
+            fc1_x_metadata=fc1_x_metadata,
         )
         self._debug("forward_exit", synchronize=True)
         return output[: routes.original_tokens], context
@@ -1005,6 +1030,7 @@ class FkRuntime:
         else:
             self._update_backward_runtime(context, padded_grad_output, fc1, fc2)
         runner = self.backward_runner
+        self._debug_fc1_wgrad_alignment(context)
         total = self.local_capacity
         offsets = torch.cumsum(context.local_counts, dim=0).to(torch.int32)
         fc1_dy, fc1_dy_scale = _raw_cudnn_operands(
