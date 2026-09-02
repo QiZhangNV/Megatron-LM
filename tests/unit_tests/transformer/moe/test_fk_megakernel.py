@@ -77,31 +77,23 @@ def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
     assert calls == ["mxfp8_e4m3"]
 
 
-def test_fk_system_cutlass_scope_swaps_and_retains_lazy_modules(monkeypatch):
-    system_modules = {"cutlass": object()}
-    fk_modules = {"cutlass": object(), "cutlass.fk": object()}
-    system_after = {"cutlass": system_modules["cutlass"], "cutlass.dsa": object()}
-    snapshots = iter((fk_modules, system_after))
-    installed = []
+def test_fk_resets_cudnn_dsa_children_and_lazy_symbol_cache(monkeypatch):
+    root = types.ModuleType(fk_runtime._CUDNN_DSA_ROOT)
+    child = types.ModuleType(f"{fk_runtime._CUDNN_DSA_ROOT}.utils.compiler")
+    root._SYMBOLS = {"sparse_attention_backward_wrapper": ("unused", "unused")}
+    root.sparse_attention_backward_wrapper = object()
+    root.compiler = child
+    root.unrelated = object()
+    monkeypatch.setitem(sys.modules, root.__name__, root)
+    monkeypatch.setitem(sys.modules, child.__name__, child)
 
-    monkeypatch.setattr(fk_runtime, "_FK_PACKAGES_SELECTED", True)
-    monkeypatch.setattr(fk_runtime, "_SYSTEM_CUTLASS_MODULES", system_modules)
-    monkeypatch.setattr(fk_runtime, "_FK_CUTLASS_MODULES", fk_modules)
-    monkeypatch.setattr(
-        fk_runtime, "_loaded_cutlass_modules", lambda: next(snapshots)
-    )
-    monkeypatch.setattr(
-        fk_runtime,
-        "_install_cutlass_modules",
-        lambda modules: installed.append(modules),
-    )
+    fk_runtime._reset_cudnn_dsa_modules_for_fk_cutlass()
 
-    with fk_runtime.system_cutlass_scope():
-        assert installed == [system_modules]
-
-    assert installed == [system_modules, fk_modules]
-    assert fk_runtime._FK_CUTLASS_MODULES == fk_modules
-    assert fk_runtime._SYSTEM_CUTLASS_MODULES == system_after
+    assert sys.modules[root.__name__] is root
+    assert child.__name__ not in sys.modules
+    assert not hasattr(root, "sparse_attention_backward_wrapper")
+    assert not hasattr(root, "compiler")
+    assert hasattr(root, "unrelated")
 
 
 def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():

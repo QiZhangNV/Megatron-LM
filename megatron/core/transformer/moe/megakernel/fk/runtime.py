@@ -9,13 +9,12 @@ shape, scopes NVSHMEM to that EP group, and supplies real MCore tensors.
 from __future__ import annotations
 
 import atexit
-from contextlib import contextmanager
 import gc
 import math
 import os
 import sys
-import threading
 from dataclasses import dataclass
+from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -106,9 +105,8 @@ _SYSTEM_DEPS: _SystemDependencies | None = None
 _FK_PACKAGES_SELECTED = False
 _NVSHMEM_STATE: tuple[tuple[int, ...], int] | None = None
 _RUNTIME_CACHE: dict[tuple[Any, ...], "FkRuntime"] = {}
-_SYSTEM_CUTLASS_MODULES: dict[str, Any] | None = None
-_FK_CUTLASS_MODULES: dict[str, Any] | None = None
-_CUTLASS_MODULE_LOCK = threading.RLock()
+
+_CUDNN_DSA_ROOT = "cudnn.deepseek_sparse_attention"
 
 
 def _mxfp8_scale_dtype() -> torch.dtype:
@@ -160,66 +158,46 @@ def _prepare_system_dependencies() -> _SystemDependencies:
     return _SYSTEM_DEPS
 
 
-def _is_cutlass_module(name: str) -> bool:
-    return (
-        name == "nvidia_cutlass_dsl"
-        or name.startswith("nvidia_cutlass_dsl.")
-        or name == "cutlass"
-        or name.startswith("cutlass.")
-    )
+def _reset_cudnn_dsa_modules_for_fk_cutlass() -> None:
+    """Make cuDNN DSA lazily re-import against FK's selected Cutlass DSL.
 
-
-def _loaded_cutlass_modules() -> dict[str, Any]:
-    return {
-        name: module
-        for name, module in sys.modules.items()
-        if module is not None and _is_cutlass_module(name)
-    }
-
-
-def _install_cutlass_modules(modules: dict[str, Any]) -> None:
-    for name in tuple(sys.modules):
-        if _is_cutlass_module(name):
-            del sys.modules[name]
-    sys.modules.update(modules)
-
-
-@contextmanager
-def system_cutlass_scope():
-    """Temporarily expose the image Cutlass modules to native cuDNN clients.
-
-    FK requires Cutlass DSL 4.6 while the image's DeepSeek sparse-attention
-    backward requires its bundled 4.5 package. Keep FK active by default, but
-    let the native DSA wrapper compile and launch entirely within its own
-    module set. Modules imported lazily inside either scope are retained for
-    the next entry.
+    ``cudnn.DSA`` is a lazy namespace, but an attention call before the first
+    FK MLP can populate its child modules with the image's Cutlass DSL. Remove
+    that child tree and the namespace's cached symbols once, immediately after
+    selecting FK's 4.6 package. Later DSA and FK calls then share one stable
+    Cutlass module identity; no runtime module swapping is required.
     """
-    global _FK_CUTLASS_MODULES, _SYSTEM_CUTLASS_MODULES
-    if not _FK_PACKAGES_SELECTED or _SYSTEM_CUTLASS_MODULES is None:
-        yield
-        return
+    dsa_root = sys.modules.get(_CUDNN_DSA_ROOT)
+    for name in tuple(sys.modules):
+        if name.startswith(f"{_CUDNN_DSA_ROOT}."):
+            del sys.modules[name]
 
-    with _CUTLASS_MODULE_LOCK:
-        _FK_CUTLASS_MODULES = _loaded_cutlass_modules()
-        _install_cutlass_modules(_SYSTEM_CUTLASS_MODULES)
-        try:
-            yield
-        finally:
-            _SYSTEM_CUTLASS_MODULES = _loaded_cutlass_modules()
-            _install_cutlass_modules(_FK_CUTLASS_MODULES)
+    if dsa_root is None:
+        return
+    symbols = getattr(dsa_root, "_SYMBOLS", {})
+    for name in symbols:
+        dsa_root.__dict__.pop(name, None)
+    for name, value in tuple(vars(dsa_root).items()):
+        if isinstance(value, ModuleType) and value.__name__.startswith(
+            f"{_CUDNN_DSA_ROOT}."
+        ):
+            dsa_root.__dict__.pop(name, None)
 
 
 def _select_fk_packages() -> None:
     """Select FK's CuTe DSL only after system cuDNN has been resolved."""
-    global _FK_CUTLASS_MODULES, _FK_PACKAGES_SELECTED, _SYSTEM_CUTLASS_MODULES
+    global _FK_PACKAGES_SELECTED
     if _FK_PACKAGES_SELECTED:
         return
     site_packages = os.environ["FK_VENV_SITE_PACKAGES"]
     fk_root = os.environ.get("FK_ROOT")
     if not fk_root or not os.path.isdir(fk_root):
         raise RuntimeError("FK_ROOT must point at the frozen FK source tree")
-    _SYSTEM_CUTLASS_MODULES = _loaded_cutlass_modules()
-    _install_cutlass_modules({})
+    for name in tuple(sys.modules):
+        if name == "nvidia_cutlass_dsl" or name.startswith("nvidia_cutlass_dsl."):
+            del sys.modules[name]
+        elif name == "cutlass" or name.startswith("cutlass."):
+            del sys.modules[name]
     for path in (site_packages, fk_root):
         try:
             sys.path.remove(path)
@@ -234,7 +212,7 @@ def _select_fk_packages() -> None:
     except ValueError:
         pass
     sys.path.insert(0, dsl_packages)
-    _FK_CUTLASS_MODULES = _loaded_cutlass_modules()
+    _reset_cudnn_dsa_modules_for_fk_cutlass()
     _FK_PACKAGES_SELECTED = True
 
 

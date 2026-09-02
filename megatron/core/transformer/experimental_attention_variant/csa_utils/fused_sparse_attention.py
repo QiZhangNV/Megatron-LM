@@ -195,14 +195,9 @@ def _ensure_dsa_namespace():
 
 
 def _sparse_attention_backward_wrapper(*args, **kwargs):
-    """Run native DSA backward with the image's Cutlass module set."""
+    """Run native DSA backward through one shared call site."""
     _ensure_dsa_namespace()
-    from megatron.core.transformer.moe.megakernel.fk.runtime import (
-        system_cutlass_scope,
-    )
-
-    with system_cutlass_scope():
-        return _DSA.sparse_attention_backward_wrapper(*args, **kwargs)
+    return _DSA.sparse_attention_backward_wrapper(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
