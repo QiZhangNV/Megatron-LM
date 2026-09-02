@@ -8,6 +8,7 @@ the shared expert remains the ordinary native MCore module.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import weakref
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,7 @@ from torch.distributed import ProcessGroup
 
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.fk.runtime import (
+    FkForwardContext,
     FkRuntimeConfig,
     get_fk_runtime,
 )
@@ -29,6 +31,11 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 )
 from megatron.core.transformer.moe.megakernel.route_adapter import (
     routing_map_to_compact_inputs,
+)
+from megatron.core.transformer.moe.paged_stash import (
+    get_paged_stash_context,
+    paged_stash_group_commit,
+    paged_stash_group_start,
 )
 from megatron.core.typed_torch import apply_module
 
@@ -63,21 +70,66 @@ class _FkAutograd(torch.autograd.Function):
             x, router_weights, top_experts, fc1_view, fc2_view
         )
 
+        # Paged stash only considers tensors carrying this attribute. Keep the
+        # route metadata resident, but let MCore page the three large, dense
+        # activation payloads that FK needs in backward. The scale workspace is
+        # columnwise and therefore has one logical token row per 32 data rows.
+        forward_context.preactivation.grouped_tensor_scale_inv = False
+        forward_context.fc1_x_data.grouped_tensor_scale_inv = False
+        forward_context.fc1_x_scale.grouped_tensor_scale_inv = True
+
         ctx.module = module
         ctx.runtime = runtime
-        ctx.forward_context = forward_context
+        ctx.original_tokens = forward_context.original_tokens
+        ctx.has_fc1_x_metadata = forward_context.fc1_x_metadata is not None
         ctx.routed_weight_views = (fc1_view, fc2_view)
-        # Saving the aliases keeps their version counters and autograd/DDP hook
-        # relationship explicit even though FK reads the physical TE payloads.
-        ctx.save_for_backward(*parameters)
+        saved_tensors = [
+            *parameters,
+            forward_context.router_weights,
+            forward_context.top_experts,
+            forward_context.local_counts,
+            forward_context.preactivation,
+            forward_context.route_index,
+            forward_context.fc1_x_data,
+            forward_context.fc1_x_scale,
+        ]
+        if forward_context.fc1_x_metadata is not None:
+            saved_tensors.append(forward_context.fc1_x_metadata)
+        # Saving the parameter aliases keeps their version counters and
+        # autograd/DDP hook relationship explicit even though FK reads the
+        # physical TE payloads. Saving the context tensors makes them visible
+        # to MCore's saved_tensors_hooks and hence paged stash.
+        ctx.save_for_backward(*saved_tensors)
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         module = ctx.module
         fc1_view, fc2_view = ctx.routed_weight_views
+        saved_tensors = ctx.saved_tensors
+        (
+            router_weights,
+            top_experts,
+            local_counts,
+            preactivation,
+            route_index,
+            fc1_x_data,
+            fc1_x_scale,
+        ) = saved_tensors[2:9]
+        fc1_x_metadata = saved_tensors[9] if ctx.has_fc1_x_metadata else None
+        forward_context = FkForwardContext(
+            original_tokens=ctx.original_tokens,
+            router_weights=router_weights,
+            top_experts=top_experts,
+            local_counts=local_counts,
+            preactivation=preactivation,
+            route_index=route_index,
+            fc1_x_data=fc1_x_data,
+            fc1_x_scale=fc1_x_scale,
+            fc1_x_metadata=fc1_x_metadata,
+        )
         d_x, d_router_weights = ctx.runtime.backward(
-            ctx.forward_context,
+            forward_context,
             grad_output.contiguous(),
             fc1_view,
             fc2_view,
@@ -91,7 +143,8 @@ class _FkAutograd(torch.autograd.Function):
 
         ctx.module = None
         ctx.runtime = None
-        ctx.forward_context = None
+        ctx.original_tokens = None
+        ctx.has_fc1_x_metadata = None
         ctx.routed_weight_views = None
         return None, d_x, d_router_weights, None, *routed_parameter_grads
 
@@ -122,6 +175,7 @@ class FkMegakernel(MegakernelBackend):
         ):
             raise ValueError("FK routed FC1/FC2 must use native single-grouped weights")
 
+        self.config = config
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
         self.hidden_size = config.hidden_size
@@ -222,14 +276,42 @@ class FkMegakernel(MegakernelBackend):
         router_weights, top_experts = routing_map_to_compact_inputs(
             probs, routing_map, self.topk, index_dtype=torch.int64
         )
-        routed_output = _FkAutograd.apply(
-            self,
-            x,
-            router_weights,
-            top_experts,
-            self.routed_fc1_weight,
-            self.routed_fc2_weight,
-        )
+        if self.config.moe_paged_stash:
+            runtime = get_fk_runtime(
+                self.runtime_config,
+                self.ep_group,
+                num_local_tokens=x.shape[0],
+                device=x.device,
+            )
+            x = paged_stash_group_start(x)
+            # FK backward consumes its fixed padded route capacity. Keep the
+            # exact saved extent for correctness; the unpadded route count is
+            # supplied separately as the allocation-sizing heuristic.
+            num_tokens_tensor = torch.full(
+                (), runtime.local_capacity, dtype=torch.int64, device=x.device
+            )
+            stash_context = get_paged_stash_context(
+                name="fk_megamoe",
+                max_num_tokens=runtime.local_capacity,
+                num_tokens_tensor=num_tokens_tensor,
+                avg_num_tokens=x.shape[0] * self.topk,
+            )
+        else:
+            stash_context = nullcontext()
+
+        with stash_context:
+            routed_output = _FkAutograd.apply(
+                self,
+                x,
+                router_weights,
+                top_experts,
+                self.routed_fc1_weight,
+                self.routed_fc2_weight,
+            )
+        if self.config.moe_paged_stash:
+            routed_output = paged_stash_group_commit(
+                routed_output, name="fk_megamoe"
+            )
 
         # The shared branch deliberately stays outside the custom autograd
         # function: native MCore/TE owns MXFP8 execution and weight gradients.

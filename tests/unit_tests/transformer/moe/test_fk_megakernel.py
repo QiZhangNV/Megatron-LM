@@ -447,10 +447,23 @@ def test_fk_route_padding_reports_destination_rank_overflow():
 
 
 def test_fk_autograd_accumulates_bf16_main_grads_and_returns_input_grads(monkeypatch):
+    paged_stash_tags = []
+
     class FakeRuntime:
         def forward(self, x, router_weights, top_experts, fc1_view, fc2_view):
-            del top_experts, fc1_view, fc2_view
-            return torch.zeros_like(x), (x.shape, router_weights.shape)
+            del fc1_view, fc2_view
+            context = fk_runtime.FkForwardContext(
+                original_tokens=x.shape[0],
+                router_weights=router_weights,
+                top_experts=top_experts,
+                local_counts=torch.tensor([x.shape[0]], dtype=torch.int32),
+                preactivation=torch.zeros((x.shape[0], 8)),
+                route_index=torch.arange(x.shape[0], dtype=torch.int32),
+                fc1_x_data=torch.zeros_like(x, dtype=torch.uint8),
+                fc1_x_scale=torch.zeros((x.shape[0] // 2, x.shape[1]), dtype=torch.uint8),
+                fc1_x_metadata=None,
+            )
+            return torch.zeros_like(x), context
 
         def backward(
             self,
@@ -489,14 +502,20 @@ def test_fk_autograd_accumulates_bf16_main_grads_and_returns_input_grads(monkeyp
     x = torch.zeros((2, 4), requires_grad=True)
     router_weights = torch.zeros((2, 2), requires_grad=True)
     top_experts = torch.zeros((2, 2), dtype=torch.int64)
-    output = fk_backend._FkAutograd.apply(
-        module,
-        x,
-        router_weights,
-        top_experts,
-        module.routed_fc1_weight,
-        module.routed_fc2_weight,
-    )
+    def pack(tensor):
+        if hasattr(tensor, "grouped_tensor_scale_inv"):
+            paged_stash_tags.append(tensor.grouped_tensor_scale_inv)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        output = fk_backend._FkAutograd.apply(
+            module,
+            x,
+            router_weights,
+            top_experts,
+            module.routed_fc1_weight,
+            module.routed_fc2_weight,
+        )
     output.sum().backward()
 
     torch.testing.assert_close(x.grad, torch.full_like(x, 4))
@@ -511,3 +530,4 @@ def test_fk_autograd_accumulates_bf16_main_grads_and_returns_input_grads(monkeyp
     )
     assert module.routed_fc1_weight.grad_added_to_main_grad
     assert module.routed_fc2_weight.grad_added_to_main_grad
+    assert Counter(paged_stash_tags) == Counter({False: 2, True: 1})
