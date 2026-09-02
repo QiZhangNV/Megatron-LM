@@ -77,6 +77,27 @@ def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
     assert calls == ["mxfp8_e4m3"]
 
 
+def test_fk_reloads_only_cudnn_dsa_backward_modules_leaf_first(monkeypatch):
+    prefix = fk_runtime._CUDNN_DSA_BACKWARD_PREFIX
+    package = types.ModuleType(prefix)
+    interface = types.ModuleType(f"{prefix}._interface_sm100")
+    kernel = types.ModuleType(f"{prefix}.kernels.flash")
+    unrelated = types.ModuleType(
+        "cudnn.deepseek_sparse_attention.sparse_attention_forward"
+    )
+    for module in (package, interface, kernel, unrelated):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    reloaded = []
+    monkeypatch.setattr(
+        fk_runtime.importlib, "reload", lambda module: reloaded.append(module) or module
+    )
+
+    fk_runtime._reload_cudnn_dsa_backward_for_fk_cutlass()
+
+    assert reloaded == [kernel, interface, package]
+
+
 def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
     total_tokens = 64
     features = 128

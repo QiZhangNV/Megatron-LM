@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import atexit
 import gc
+import importlib
 import math
 import os
 import sys
@@ -105,6 +106,8 @@ _FK_PACKAGES_SELECTED = False
 _NVSHMEM_STATE: tuple[tuple[int, ...], int] | None = None
 _RUNTIME_CACHE: dict[tuple[Any, ...], "FkRuntime"] = {}
 
+_CUDNN_DSA_BACKWARD_PREFIX = "cudnn.deepseek_sparse_attention.sparse_attention_backward"
+
 
 def _mxfp8_scale_dtype() -> torch.dtype:
     """Resolve FK's public MXFP8 scale dtype for the selected data kind."""
@@ -155,6 +158,32 @@ def _prepare_system_dependencies() -> _SystemDependencies:
     return _SYSTEM_DEPS
 
 
+def _reload_cudnn_dsa_backward_for_fk_cutlass() -> None:
+    """Rebind loaded cuDNN DSA backward modules to FK's Cutlass package.
+
+    The image imports cuDNN DSA against its bundled Cutlass DSL before the FK
+    runtime selects the newer package required by the frozen FK kernels. DSA
+    backward is compiled lazily, so its old @cute.jit objects otherwise
+    receive runtime tensor objects from the new package and fail Python type
+    identity checks. Reload the still-uncompiled backward subtree after the
+    package selection. Existing DSA forward modules and compile caches remain
+    untouched.
+    """
+    modules = [
+        module
+        for name, module in sys.modules.items()
+        if module is not None
+        and (
+            name == _CUDNN_DSA_BACKWARD_PREFIX
+            or name.startswith(f"{_CUDNN_DSA_BACKWARD_PREFIX}.")
+        )
+    ]
+    # Reload leaves first so interfaces bind freshly decorated kernel helpers.
+    modules.sort(key=lambda module: module.__name__.count("."), reverse=True)
+    for module in modules:
+        importlib.reload(module)
+
+
 def _select_fk_packages() -> None:
     """Select FK's CuTe DSL only after system cuDNN has been resolved."""
     global _FK_PACKAGES_SELECTED
@@ -183,6 +212,7 @@ def _select_fk_packages() -> None:
     except ValueError:
         pass
     sys.path.insert(0, dsl_packages)
+    _reload_cudnn_dsa_backward_for_fk_cutlass()
     _FK_PACKAGES_SELECTED = True
 
 
