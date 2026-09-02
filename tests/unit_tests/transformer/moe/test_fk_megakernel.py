@@ -98,6 +98,19 @@ def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
     )
 
 
+def test_fk_reused_kernel_is_bracketed_by_ep_barriers():
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    events = []
+    runtime._ep_barrier = lambda: events.append("barrier")
+
+    def compiled_kernel(**kwargs):
+        events.append(("kernel", kwargs))
+
+    runtime._launch_distributed_kernel(compiled_kernel, {"value": 7})
+
+    assert events == ["barrier", ("kernel", {"value": 7}), "barrier"]
+
+
 def test_fk_bwd_epi_flag_batch_cli_contract():
     field_name = "fk_bwd_epi_flag_batch"
     exclude = [

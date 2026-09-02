@@ -377,6 +377,12 @@ class FkRuntime:
         _prepare_system_dependencies().nvshmem.barrier_all(torch.cuda.current_stream())
         torch.cuda.synchronize()
 
+    def _launch_distributed_kernel(self, compiled_kernel, kwargs) -> None:
+        """Launch a reused FK kernel with the vendor runner's rendezvous protocol."""
+        self._ep_barrier()
+        compiled_kernel(**kwargs)
+        self._ep_barrier()
+
     def _precompile_wgrads(self, cudnn_wgrad) -> None:
         counts = torch.full(
             (self.config.num_local_experts,),
@@ -662,8 +668,8 @@ class FkRuntime:
         kwargs["fc1_c_route_index"] = _to_cute(route_index, assumed_align=4)
         kwargs["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self._debug("update_forward_before_kernel")
-        runner._compiled_kernel(**kwargs)
-        self._debug("update_forward_after_kernel", synchronize=True)
+        self._launch_distributed_kernel(runner._compiled_kernel, kwargs)
+        self._debug("update_forward_after_kernel")
         runner._mcore_activation_quant = quantized
 
     def forward(
@@ -931,8 +937,13 @@ class FkRuntime:
         kwargs["saved_preact_route_index"] = _to_cute(context.route_index)
         kwargs["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self._debug("update_backward_before_kernel")
-        runner._compiled_kernel(**kwargs)
-        self._debug("update_backward_after_kernel", synchronize=True)
+        # Match MegaDswigluMxfp8Tester's repeated-launch protocol: local
+        # counters are reset above, then every distributed kernel launch is
+        # bracketed by torch.distributed + NVSHMEM barriers.  Reusing the
+        # communication workspace without this rendezvous can leave peer
+        # ranks observing counters from different launches and deadlock.
+        self._launch_distributed_kernel(runner._compiled_kernel, kwargs)
+        self._debug("update_backward_after_kernel")
         runner._mcore_grad_quant = quantized
         self._debug("update_backward_before_col_requant")
         self._launch_col_requant(context.local_counts)
