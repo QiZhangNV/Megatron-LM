@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
+from argparse import ArgumentParser
 from collections import Counter
 
 import pytest
@@ -14,6 +16,7 @@ from megatron.core.transformer.moe.megakernel.fk.route_padding import (
     calculate_local_route_capacity,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.argument_utils import ArgumentGroupFactory
 
 
 def _fk_transformer_config(**overrides):
@@ -48,6 +51,22 @@ def test_fk_backend_accepts_mvp_configuration():
     assert config.moe_megakernel_backend == "fk"
     assert config.moe_single_grouped_weight
     assert config.moe_mlp_glu_interleave_size == 32
+
+
+def test_fk_bwd_epi_flag_batch_cli_contract():
+    field_name = "fk_bwd_epi_flag_batch"
+    exclude = [
+        attribute.name
+        for attribute in dataclasses.fields(TransformerConfig)
+        if attribute.name != field_name
+    ]
+    parser = ArgumentParser()
+    ArgumentGroupFactory(TransformerConfig, exclude=exclude).build_group(parser)
+
+    assert parser.parse_args([]).fk_bwd_epi_flag_batch == (1, 1)
+    assert parser.parse_args(
+        ["--fk-bwd-epi-flag-batch", "1", "4"]
+    ).fk_bwd_epi_flag_batch == [1, 4]
 
 
 @pytest.mark.parametrize(

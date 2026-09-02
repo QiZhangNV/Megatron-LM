@@ -839,7 +839,9 @@ class TransformerConfig(ModelParallelConfig):
     fk_bwd_token_back_mode: str = "standalone_warps"
     """FK backward token-return implementation."""
 
-    fk_bwd_epi_flag_batch: Tuple[int, int] = (1, 1)
+    fk_bwd_epi_flag_batch: Tuple[int, int] = field(
+        default=(1, 1), metadata={"argparse_meta": {"type": int, "nargs": 2}}
+    )
     """FK backward epilogue flag batching tuple."""
 
     moe_layer_freq: Union[int, List[int]] = 1
