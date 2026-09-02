@@ -12,9 +12,7 @@ import atexit
 import gc
 import math
 import os
-import shutil
 import sys
-import tempfile
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -108,29 +106,6 @@ _NVSHMEM_STATE: tuple[tuple[int, ...], int] | None = None
 _RUNTIME_CACHE: dict[tuple[Any, ...], "FkRuntime"] = {}
 
 
-def _configure_fk_cute_dsl_cache() -> str:
-    """Keep FK's CuTe DSL file cache private to the current worker process.
-
-    The current CuTe DSL file-cache key does not cover every rank-dependent
-    compile-time value used by FK. Sharing its default node-local cache across
-    ranks can therefore load an incompatible IR module on a later rank or job.
-    A process-scoped directory retains normal in-process caching while avoiding
-    cross-rank and stale-job cache contamination. An explicit operator-provided
-    cache directory remains authoritative.
-    """
-    configured = os.environ.get("CUTE_DSL_CACHE_DIR")
-    if configured:
-        return configured
-
-    job_id = os.environ.get("SLURM_JOB_ID", "local").replace(os.sep, "_")
-    cache_dir = os.path.join(
-        tempfile.gettempdir(), f"mcore_fk_cute_cache_{job_id}_{os.getpid()}"
-    )
-    os.environ["CUTE_DSL_CACHE_DIR"] = cache_dir
-    atexit.register(shutil.rmtree, cache_dir, ignore_errors=True)
-    return cache_dir
-
-
 def _mxfp8_scale_dtype() -> torch.dtype:
     """Resolve FK's public MXFP8 scale dtype for the selected data kind."""
     from common.host_utils import kind_scale_dtype
@@ -185,7 +160,6 @@ def _select_fk_packages() -> None:
     global _FK_PACKAGES_SELECTED
     if _FK_PACKAGES_SELECTED:
         return
-    _configure_fk_cute_dsl_cache()
     site_packages = os.environ["FK_VENV_SITE_PACKAGES"]
     fk_root = os.environ.get("FK_ROOT")
     if not fk_root or not os.path.isdir(fk_root):
