@@ -29,6 +29,7 @@ def _fk_transformer_config(**overrides):
         "activation_func": F.silu,
         "gradient_accumulation_fusion": True,
         "moe_grouped_gemm": True,
+        "moe_token_dispatcher_type": "flex",
         "moe_single_grouped_weight": True,
         "moe_mlp_glu_interleave_size": 32,
         "use_transformer_engine_op_fuser": False,
