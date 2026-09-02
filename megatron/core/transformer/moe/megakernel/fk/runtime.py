@@ -341,6 +341,9 @@ class FkRuntime:
         self._col_requant_sizes = None
         self._fc2_dy_data = None
         self._fc2_dy_scale = None
+        self._forward_calls = 0
+        self._backward_calls = 0
+        self._debug_enabled = os.environ.get("FK_MCORE_DEBUG", "0") == "1"
 
         deps = _prepare_system_dependencies()
         self._precompile_wgrads(deps.cudnn_wgrad)
@@ -354,6 +357,19 @@ class FkRuntime:
                 f"capacity_factor={config.capacity_factor}",
                 flush=True,
             )
+
+    def _debug(self, event: str, *, synchronize: bool = False) -> None:
+        """Emit opt-in runtime markers without affecting the default FK path."""
+        if not self._debug_enabled:
+            return
+        if synchronize:
+            torch.cuda.synchronize()
+        print(
+            "FK_MCORE_DEBUG "
+            f"rank={self.ep_rank} forward_call={self._forward_calls} "
+            f"backward_call={self._backward_calls} event={event}",
+            flush=True,
+        )
 
     def _ep_barrier(self) -> None:
         torch.cuda.synchronize()
@@ -441,10 +457,12 @@ class FkRuntime:
             raise RuntimeError(
                 "FK MVP requires exactly topk valid expert indices per token"
             )
+        self._debug("pad_routes_before_counts_all_reduce")
         counts = torch.bincount(
             top_experts.flatten(), minlength=self.config.num_experts
         )
         dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=self.ep_group)
+        self._debug("pad_routes_after_counts_all_reduce", synchronize=True)
         plan = build_route_padding_plan(
             counts.cpu().tolist(),
             ep_size=self.ep_size,
@@ -643,7 +661,9 @@ class FkRuntime:
         kwargs["fc1_c"] = _to_cute(preactivation)
         kwargs["fc1_c_route_index"] = _to_cute(route_index, assumed_align=4)
         kwargs["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self._debug("update_forward_before_kernel")
         runner._compiled_kernel(**kwargs)
+        self._debug("update_forward_after_kernel", synchronize=True)
         runner._mcore_activation_quant = quantized
 
     def forward(
@@ -654,9 +674,14 @@ class FkRuntime:
         fc1: FkWeightView,
         fc2: FkWeightView,
     ) -> tuple[torch.Tensor, FkForwardContext]:
+        self._forward_calls += 1
+        self._debug("forward_enter")
         routes = self._pad_routes(activation, router_weights, top_experts)
+        self._debug("forward_after_pad_routes")
         if self.forward_runner is None:
+            self._debug("forward_before_build_runner")
             self._build_forward_runner(routes, fc1, fc2)
+            self._debug("forward_after_build_runner", synchronize=True)
             runner = self.forward_runner
             output = runner.output_activation
             preactivation = runner._c_output
@@ -685,6 +710,7 @@ class FkRuntime:
                 preactivation=preactivation,
                 route_index=route_index,
             )
+        self._debug("forward_before_context_copy")
         if preactivation.shape[0] != self.local_capacity:
             raise RuntimeError(
                 "FK forward preactivation capacity mismatch: "
@@ -707,6 +733,7 @@ class FkRuntime:
             fc1_x_data=fc1_x_data,
             fc1_x_scale=fc1_x_scale,
         )
+        self._debug("forward_exit", synchronize=True)
         return output[: routes.original_tokens], context
 
     def _set_backward_weights(
@@ -903,9 +930,13 @@ class FkRuntime:
         kwargs["fc1_preact"] = _to_cute(context.preactivation, assumed_align=128)
         kwargs["saved_preact_route_index"] = _to_cute(context.route_index)
         kwargs["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self._debug("update_backward_before_kernel")
         runner._compiled_kernel(**kwargs)
+        self._debug("update_backward_after_kernel", synchronize=True)
         runner._mcore_grad_quant = quantized
+        self._debug("update_backward_before_col_requant")
         self._launch_col_requant(context.local_counts)
+        self._debug("update_backward_after_col_requant", synchronize=True)
 
     def _launch_wgrad(
         self,
@@ -942,6 +973,8 @@ class FkRuntime:
         fc1_main_grad: torch.Tensor,
         fc2_main_grad: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._backward_calls += 1
+        self._debug("backward_enter")
         dummy_tokens = self.padded_num_local_tokens - context.original_tokens
         padded_grad_output = torch.cat(
             (
@@ -955,7 +988,9 @@ class FkRuntime:
             dim=0,
         )
         if self.backward_runner is None:
+            self._debug("backward_before_build_runner")
             self._build_backward_runner(context, padded_grad_output, fc1, fc2)
+            self._debug("backward_after_build_runner", synchronize=True)
         else:
             self._update_backward_runtime(context, padded_grad_output, fc1, fc2)
         runner = self.backward_runner
@@ -989,12 +1024,17 @@ class FkRuntime:
             self.config.intermediate_size,
             transpose=False,
         )
+        self._debug("backward_before_fc1_wgrad")
         self._launch_wgrad(
             fc1_main_grad, fc1_dy, fc1_dy_scale, fc1_x, fc1_x_scale, offsets
         )
+        self._debug("backward_after_fc1_wgrad", synchronize=True)
+        self._debug("backward_before_fc2_wgrad")
         self._launch_wgrad(
             fc2_main_grad, fc2_dy, fc2_dy_scale, fc2_x, fc2_x_scale, offsets
         )
+        self._debug("backward_after_fc2_wgrad", synchronize=True)
+        self._debug("backward_exit")
         return (
             runner.grad_activation[: context.original_tokens],
             runner.dprob[: context.original_tokens],
