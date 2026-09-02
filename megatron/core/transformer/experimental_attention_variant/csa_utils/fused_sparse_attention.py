@@ -194,6 +194,17 @@ def _ensure_dsa_namespace():
     _DSA = _ns
 
 
+def _sparse_attention_backward_wrapper(*args, **kwargs):
+    """Run native DSA backward with the image's Cutlass module set."""
+    _ensure_dsa_namespace()
+    from megatron.core.transformer.moe.megakernel.fk.runtime import (
+        system_cutlass_scope,
+    )
+
+    with system_cutlass_scope():
+        return _DSA.sparse_attention_backward_wrapper(*args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Index helpers
 # ---------------------------------------------------------------------------
@@ -740,25 +751,17 @@ class CSASparseAttnFunc(torch.autograd.Function):
 
         q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
 
-        # FK uses a newer Cutlass DSL than this image's cuDNN DSA package.
-        # Keep the switch scoped to native DSA compile/launch; FK remains the
-        # process default for its routed-expert runtime.
-        from megatron.core.transformer.moe.megakernel.fk.runtime import (
-            system_cutlass_scope,
+        result = _sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dO,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=ctx.softmax_scale,
+            topk_length=ctx.topk_length,
         )
-
-        with system_cutlass_scope():
-            result = _DSA.sparse_attention_backward_wrapper(
-                q,
-                kv,
-                out,
-                dO,
-                lse,
-                attn_sink,
-                topk_idxs,
-                softmax_scale=ctx.softmax_scale,
-                topk_length=ctx.topk_length,
-            )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
         return dq, dkv, d_sink, None, None, None, None
 
@@ -1859,7 +1862,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
 
-        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+        attn_bwd = _sparse_attention_backward_wrapper(
             q_flat,
             kv_flat,
             out_flat,
@@ -2201,7 +2204,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
-        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+        attn_bwd = _sparse_attention_backward_wrapper(
             query,
             kv_full,
             out_flat,
