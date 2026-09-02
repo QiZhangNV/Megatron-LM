@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import sys
+import types
 from argparse import ArgumentParser
 from collections import Counter
 
@@ -10,6 +12,7 @@ import torch.nn.functional as F
 
 from megatron.core.transformer.moe.megakernel import factory
 from megatron.core.transformer.moe.megakernel.fk import backend as fk_backend
+from megatron.core.transformer.moe.megakernel.fk import runtime as fk_runtime
 from megatron.core.transformer.moe.megakernel.fk.route_padding import (
     FK_ROUTE_ALIGNMENT,
     build_route_padding_plan,
@@ -51,6 +54,24 @@ def test_fk_backend_accepts_mvp_configuration():
     assert config.moe_megakernel_backend == "fk"
     assert config.moe_single_grouped_weight
     assert config.moe_mlp_glu_interleave_size == 32
+
+
+def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
+    calls = []
+    common = types.ModuleType("common")
+    common.__path__ = []
+    host_utils = types.ModuleType("common.host_utils")
+
+    def kind_scale_dtype(kind):
+        calls.append(kind)
+        return torch.float8_e8m0fnu
+
+    host_utils.kind_scale_dtype = kind_scale_dtype
+    monkeypatch.setitem(sys.modules, "common", common)
+    monkeypatch.setitem(sys.modules, "common.host_utils", host_utils)
+
+    assert fk_runtime._mxfp8_scale_dtype() is torch.float8_e8m0fnu
+    assert calls == ["mxfp8_e4m3"]
 
 
 def test_fk_bwd_epi_flag_batch_cli_contract():

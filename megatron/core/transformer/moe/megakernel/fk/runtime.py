@@ -106,6 +106,13 @@ _NVSHMEM_STATE: tuple[tuple[int, ...], int] | None = None
 _RUNTIME_CACHE: dict[tuple[Any, ...], "FkRuntime"] = {}
 
 
+def _mxfp8_scale_dtype() -> torch.dtype:
+    """Resolve FK's public MXFP8 scale dtype for the selected data kind."""
+    from common.host_utils import kind_scale_dtype
+
+    return kind_scale_dtype("mxfp8_e4m3")
+
+
 def _temporary_site_import(site_packages: str, module_name: str):
     sys.path.insert(0, site_packages)
     try:
@@ -510,7 +517,6 @@ class FkRuntime:
     def _build_forward_runner(
         self, routes: _PaddedRoutes, fc1: FkWeightView, fc2: FkWeightView
     ) -> None:
-        from common.megamoe_constants import Mxfp8ScaleDtype
         from moe_mxfp8_glu.mega_runner import (
             MegaMoEMxfp8Tester,
             _sym_zeros,
@@ -578,7 +584,7 @@ class FkRuntime:
         )
         runner.my_activation = _sym_zeros_byte_view_1b((t, h), torch.float8_e4m3fn)
         runner.my_activation_sf = _sym_zeros_byte_view_1b(
-            (t, math.ceil(h / 32 / 4) * 4), Mxfp8ScaleDtype
+            (t, math.ceil(h / 32 / 4) * 4), _mxfp8_scale_dtype()
         )
         runner.my_topk_idx = _sym_zeros((t, k), torch.int64)
         runner.my_topk_weights = _sym_zeros((t, k), torch.float32)
@@ -715,7 +721,6 @@ class FkRuntime:
         fc1: FkWeightView,
         fc2: FkWeightView,
     ) -> None:
-        from common.megamoe_constants import Mxfp8ScaleDtype
         from moe_mxfp8_dglu.mega_runner import MegaDswigluMxfp8Tester, _sym_zeros
         from moe_mxfp8_glu.runner_common import TrainingBackwardImplDesc
         from moe_nvfp4_swapab.runner_fc12_common import MiscDesc, ProblemDesc
@@ -775,7 +780,7 @@ class FkRuntime:
         runner.my_grad_out = _sym_zeros((t, h), torch.uint8).view(torch.float8_e4m3fn)
         runner.my_grad_out_sf = _sym_zeros(
             (t, math.ceil(h / 32 / 4) * 4), torch.uint8
-        ).view(Mxfp8ScaleDtype)
+        ).view(_mxfp8_scale_dtype())
         runner.my_topk_idx = _sym_zeros((t, k), torch.int64)
         runner.my_topk_weights = _sym_zeros((t, k), torch.float32)
         runner.grad_activation = torch.zeros(
