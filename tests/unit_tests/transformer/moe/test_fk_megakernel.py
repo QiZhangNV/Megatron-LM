@@ -2,6 +2,7 @@
 
 import dataclasses
 import inspect
+import os
 import sys
 import types
 from argparse import ArgumentParser
@@ -75,6 +76,38 @@ def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
 
     assert fk_runtime._mxfp8_scale_dtype() is torch.float8_e8m0fnu
     assert calls == ["mxfp8_e4m3"]
+
+
+def test_fk_cute_dsl_cache_is_scoped_to_worker_process(monkeypatch, tmp_path):
+    cleanup = []
+    monkeypatch.delenv("CUTE_DSL_CACHE_DIR", raising=False)
+    monkeypatch.setenv("SLURM_JOB_ID", "641663")
+    monkeypatch.setattr(fk_runtime.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(fk_runtime.os, "getpid", lambda: 12345)
+    monkeypatch.setattr(
+        fk_runtime.atexit,
+        "register",
+        lambda *args, **kwargs: cleanup.append((args, kwargs)),
+    )
+
+    cache_dir = fk_runtime._configure_fk_cute_dsl_cache()
+
+    assert cache_dir == str(tmp_path / "mcore_fk_cute_cache_641663_12345")
+    assert os.environ["CUTE_DSL_CACHE_DIR"] == cache_dir
+    assert cleanup == [((fk_runtime.shutil.rmtree, cache_dir), {"ignore_errors": True})]
+
+
+def test_fk_cute_dsl_cache_respects_explicit_directory(monkeypatch):
+    cleanup = []
+    monkeypatch.setenv("CUTE_DSL_CACHE_DIR", "/operator/cache")
+    monkeypatch.setattr(
+        fk_runtime.atexit,
+        "register",
+        lambda *args, **kwargs: cleanup.append((args, kwargs)),
+    )
+
+    assert fk_runtime._configure_fk_cute_dsl_cache() == "/operator/cache"
+    assert cleanup == []
 
 
 def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
