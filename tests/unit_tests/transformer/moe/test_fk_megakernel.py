@@ -77,25 +77,31 @@ def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
     assert calls == ["mxfp8_e4m3"]
 
 
-def test_fk_reloads_only_cudnn_dsa_backward_modules_leaf_first(monkeypatch):
-    prefix = fk_runtime._CUDNN_DSA_BACKWARD_PREFIX
-    package = types.ModuleType(prefix)
-    interface = types.ModuleType(f"{prefix}._interface_sm100")
-    kernel = types.ModuleType(f"{prefix}.kernels.flash")
-    unrelated = types.ModuleType(
-        "cudnn.deepseek_sparse_attention.sparse_attention_forward"
-    )
-    for module in (package, interface, kernel, unrelated):
-        monkeypatch.setitem(sys.modules, module.__name__, module)
+def test_fk_system_cutlass_scope_swaps_and_retains_lazy_modules(monkeypatch):
+    system_modules = {"cutlass": object()}
+    fk_modules = {"cutlass": object(), "cutlass.fk": object()}
+    system_after = {"cutlass": system_modules["cutlass"], "cutlass.dsa": object()}
+    snapshots = iter((fk_modules, system_after))
+    installed = []
 
-    reloaded = []
+    monkeypatch.setattr(fk_runtime, "_FK_PACKAGES_SELECTED", True)
+    monkeypatch.setattr(fk_runtime, "_SYSTEM_CUTLASS_MODULES", system_modules)
+    monkeypatch.setattr(fk_runtime, "_FK_CUTLASS_MODULES", fk_modules)
     monkeypatch.setattr(
-        fk_runtime.importlib, "reload", lambda module: reloaded.append(module) or module
+        fk_runtime, "_loaded_cutlass_modules", lambda: next(snapshots)
+    )
+    monkeypatch.setattr(
+        fk_runtime,
+        "_install_cutlass_modules",
+        lambda modules: installed.append(modules),
     )
 
-    fk_runtime._reload_cudnn_dsa_backward_for_fk_cutlass()
+    with fk_runtime.system_cutlass_scope():
+        assert installed == [system_modules]
 
-    assert reloaded == [kernel, interface, package]
+    assert installed == [system_modules, fk_modules]
+    assert fk_runtime._FK_CUTLASS_MODULES == fk_modules
+    assert fk_runtime._SYSTEM_CUTLASS_MODULES == system_after
 
 
 def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():

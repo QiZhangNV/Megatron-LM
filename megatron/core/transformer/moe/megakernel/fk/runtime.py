@@ -9,11 +9,12 @@ shape, scopes NVSHMEM to that EP group, and supplies real MCore tensors.
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
 import gc
-import importlib
 import math
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -105,8 +106,9 @@ _SYSTEM_DEPS: _SystemDependencies | None = None
 _FK_PACKAGES_SELECTED = False
 _NVSHMEM_STATE: tuple[tuple[int, ...], int] | None = None
 _RUNTIME_CACHE: dict[tuple[Any, ...], "FkRuntime"] = {}
-
-_CUDNN_DSA_BACKWARD_PREFIX = "cudnn.deepseek_sparse_attention.sparse_attention_backward"
+_SYSTEM_CUTLASS_MODULES: dict[str, Any] | None = None
+_FK_CUTLASS_MODULES: dict[str, Any] | None = None
+_CUTLASS_MODULE_LOCK = threading.RLock()
 
 
 def _mxfp8_scale_dtype() -> torch.dtype:
@@ -158,46 +160,66 @@ def _prepare_system_dependencies() -> _SystemDependencies:
     return _SYSTEM_DEPS
 
 
-def _reload_cudnn_dsa_backward_for_fk_cutlass() -> None:
-    """Rebind loaded cuDNN DSA backward modules to FK's Cutlass package.
+def _is_cutlass_module(name: str) -> bool:
+    return (
+        name == "nvidia_cutlass_dsl"
+        or name.startswith("nvidia_cutlass_dsl.")
+        or name == "cutlass"
+        or name.startswith("cutlass.")
+    )
 
-    The image imports cuDNN DSA against its bundled Cutlass DSL before the FK
-    runtime selects the newer package required by the frozen FK kernels. DSA
-    backward is compiled lazily, so its old @cute.jit objects otherwise
-    receive runtime tensor objects from the new package and fail Python type
-    identity checks. Reload the still-uncompiled backward subtree after the
-    package selection. Existing DSA forward modules and compile caches remain
-    untouched.
-    """
-    modules = [
-        module
+
+def _loaded_cutlass_modules() -> dict[str, Any]:
+    return {
+        name: module
         for name, module in sys.modules.items()
-        if module is not None
-        and (
-            name == _CUDNN_DSA_BACKWARD_PREFIX
-            or name.startswith(f"{_CUDNN_DSA_BACKWARD_PREFIX}.")
-        )
-    ]
-    # Reload leaves first so interfaces bind freshly decorated kernel helpers.
-    modules.sort(key=lambda module: module.__name__.count("."), reverse=True)
-    for module in modules:
-        importlib.reload(module)
+        if module is not None and _is_cutlass_module(name)
+    }
+
+
+def _install_cutlass_modules(modules: dict[str, Any]) -> None:
+    for name in tuple(sys.modules):
+        if _is_cutlass_module(name):
+            del sys.modules[name]
+    sys.modules.update(modules)
+
+
+@contextmanager
+def system_cutlass_scope():
+    """Temporarily expose the image Cutlass modules to native cuDNN clients.
+
+    FK requires Cutlass DSL 4.6 while the image's DeepSeek sparse-attention
+    backward requires its bundled 4.5 package. Keep FK active by default, but
+    let the native DSA wrapper compile and launch entirely within its own
+    module set. Modules imported lazily inside either scope are retained for
+    the next entry.
+    """
+    global _FK_CUTLASS_MODULES, _SYSTEM_CUTLASS_MODULES
+    if not _FK_PACKAGES_SELECTED or _SYSTEM_CUTLASS_MODULES is None:
+        yield
+        return
+
+    with _CUTLASS_MODULE_LOCK:
+        _FK_CUTLASS_MODULES = _loaded_cutlass_modules()
+        _install_cutlass_modules(_SYSTEM_CUTLASS_MODULES)
+        try:
+            yield
+        finally:
+            _SYSTEM_CUTLASS_MODULES = _loaded_cutlass_modules()
+            _install_cutlass_modules(_FK_CUTLASS_MODULES)
 
 
 def _select_fk_packages() -> None:
     """Select FK's CuTe DSL only after system cuDNN has been resolved."""
-    global _FK_PACKAGES_SELECTED
+    global _FK_CUTLASS_MODULES, _FK_PACKAGES_SELECTED, _SYSTEM_CUTLASS_MODULES
     if _FK_PACKAGES_SELECTED:
         return
     site_packages = os.environ["FK_VENV_SITE_PACKAGES"]
     fk_root = os.environ.get("FK_ROOT")
     if not fk_root or not os.path.isdir(fk_root):
         raise RuntimeError("FK_ROOT must point at the frozen FK source tree")
-    for name in tuple(sys.modules):
-        if name == "nvidia_cutlass_dsl" or name.startswith("nvidia_cutlass_dsl."):
-            del sys.modules[name]
-        elif name == "cutlass" or name.startswith("cutlass."):
-            del sys.modules[name]
+    _SYSTEM_CUTLASS_MODULES = _loaded_cutlass_modules()
+    _install_cutlass_modules({})
     for path in (site_packages, fk_root):
         try:
             sys.path.remove(path)
@@ -212,7 +234,7 @@ def _select_fk_packages() -> None:
     except ValueError:
         pass
     sys.path.insert(0, dsl_packages)
-    _reload_cudnn_dsa_backward_for_fk_cutlass()
+    _FK_CUTLASS_MODULES = _loaded_cutlass_modules()
     _FK_PACKAGES_SELECTED = True
 
 
