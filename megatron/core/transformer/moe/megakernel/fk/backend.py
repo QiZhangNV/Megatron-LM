@@ -155,29 +155,27 @@ class FkMegakernel(MegakernelBackend):
     def quantized_routed_weights(self):
         """Build or refresh stable FK views over native grouped MXFP8 storage."""
         if self._routed_weight_view_cache is None or self.is_first_microbatch:
-            cached_fc1 = (
-                None
-                if self._routed_weight_view_cache is None
-                else self._routed_weight_view_cache[1]
-            )
-            cached_fc2 = (
-                None
-                if self._routed_weight_view_cache is None
-                else self._routed_weight_view_cache[3]
-            )
+            if self._routed_weight_view_cache is None:
+                cached_fc1_view = cached_fc1_native = None
+                cached_fc2_view = cached_fc2_native = None
+            else:
+                cached_fc1_view, cached_fc1_native = self._routed_weight_view_cache[:2]
+                cached_fc2_view, cached_fc2_native = self._routed_weight_view_cache[2:]
             fc1_view, fc1_native = native_single_grouped_weight_view(
                 self.routed_fc1_weight,
                 num_experts=self.num_local_experts,
                 rows=2 * self.intermediate_size,
                 columns=self.hidden_size,
-                cached_native_view=cached_fc1,
+                cached_view=cached_fc1_view,
+                cached_native_view=cached_fc1_native,
             )
             fc2_view, fc2_native = native_single_grouped_weight_view(
                 self.routed_fc2_weight,
                 num_experts=self.num_local_experts,
                 rows=self.hidden_size,
                 columns=self.intermediate_size,
-                cached_native_view=cached_fc2,
+                cached_view=cached_fc2_view,
+                cached_native_view=cached_fc2_native,
             )
             self._routed_weight_view_cache = (
                 fc1_view,

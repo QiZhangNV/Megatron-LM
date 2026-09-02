@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import inspect
 import sys
 import types
 from argparse import ArgumentParser
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 from megatron.core.transformer.moe.megakernel import factory
 from megatron.core.transformer.moe.megakernel.fk import backend as fk_backend
 from megatron.core.transformer.moe.megakernel.fk import runtime as fk_runtime
+from megatron.core.transformer.moe.megakernel.fk import weights as fk_weights
 from megatron.core.transformer.moe.megakernel.fk.route_padding import (
     FK_ROUTE_ALIGNMENT,
     build_route_padding_plan,
@@ -109,6 +111,137 @@ def test_fk_reused_kernel_is_bracketed_by_ep_barriers():
     runtime._launch_distributed_kernel(compiled_kernel, {"value": 7})
 
     assert events == ["barrier", ("kernel", {"value": 7}), "barrier"]
+
+
+def test_fk_columnwise_payload_transpose_reuses_cached_storage(monkeypatch):
+    experts, rows, columns = 2, 4, 6
+    row_data = torch.arange(experts * rows * columns, dtype=torch.uint8).reshape(
+        experts, rows, columns
+    )
+    column_data = (row_data + 37).remainder(251)
+    row_scale = torch.zeros((experts, 2), dtype=torch.uint8)
+    column_scale = torch.ones((experts, 2), dtype=torch.uint8)
+    native_view = (row_data, row_scale, column_data, column_scale, True)
+
+    monkeypatch.setattr(
+        fk_weights,
+        "_native_single_grouped_weight_view",
+        lambda *args, **kwargs: native_view,
+    )
+    weight = torch.nn.Parameter(torch.zeros((experts, rows, columns)))
+    first, cached_native = fk_weights.native_single_grouped_weight_view(
+        weight,
+        num_experts=experts,
+        rows=rows,
+        columns=columns,
+    )
+
+    expected_storage = column_data.transpose(1, 2).contiguous()
+    torch.testing.assert_close(first.backward_data.transpose(1, 2), expected_storage)
+    assert first.backward_data.shape == (experts, rows, columns)
+    assert first.backward_data.stride() == (rows * columns, 1, rows)
+    data_ptr = first.backward_data.data_ptr()
+
+    column_data.add_(11)
+    refreshed, _ = fk_weights.native_single_grouped_weight_view(
+        weight,
+        num_experts=experts,
+        rows=rows,
+        columns=columns,
+        cached_view=first,
+        cached_native_view=cached_native,
+    )
+    assert refreshed.backward_data.data_ptr() == data_ptr
+    torch.testing.assert_close(
+        refreshed.backward_data.transpose(1, 2),
+        column_data.transpose(1, 2).contiguous(),
+    )
+
+
+def test_fk_native_mxfp8_columnwise_view_matches_transpose_quantization(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("native MXFP8 parameter parity requires a Blackwell GPU")
+
+    import transformer_engine.pytorch as te
+    import transformer_engine_torch as tex
+    from transformer_engine.common.recipe import Format, MXFP8BlockScaling
+
+    from megatron.core.fp8_utils import copy_tensor_to_quantized_param
+
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+    experts, rows, columns = 1, 7168, 3072
+    torch.manual_seed(1234)
+    source = torch.randn(
+        (experts, rows, columns), device="cuda", dtype=torch.bfloat16
+    )
+    recipe = MXFP8BlockScaling(fp8_format=Format.HYBRID)
+    constructor_kwargs = {
+        "sequence_parallel": False,
+        "fuse_wgrad_accumulation": True,
+        "tp_group": None,
+        "tp_size": 1,
+        "get_rng_state_tracker": None,
+        "init_method": torch.nn.init.normal_,
+        "bias": False,
+        "return_bias": False,
+        "parallel_mode": None,
+        "single_grouped_weight": True,
+        "params_dtype": torch.bfloat16,
+        "device": "cuda",
+    }
+    supported = inspect.signature(te.GroupedLinear.__init__).parameters
+    constructor_kwargs = {
+        key: value for key, value in constructor_kwargs.items() if key in supported
+    }
+    with te.quantized_model_init(
+        enabled=True,
+        recipe=recipe,
+        preserve_high_precision_init_val=True,
+    ):
+        layer = te.GroupedLinear(
+            num_gemms=experts,
+            in_features=columns,
+            out_features=rows,
+            **constructor_kwargs,
+        )
+    copy_tensor_to_quantized_param(layer.weight, source)
+
+    actual, _ = fk_weights.native_single_grouped_weight_view(
+        layer.weight,
+        num_experts=experts,
+        rows=rows,
+        columns=columns,
+    )
+    quantizer = te.MXFP8Quantizer(
+        tex.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=False,
+    )
+    quantizer.optimize_for_gemm = True
+    reference = tex.group_quantize(
+        source.transpose(1, 2).contiguous().reshape(experts * columns, rows),
+        quantizer,
+        experts,
+        None,
+    )
+    expected_data = (
+        reference.rowwise_data.view(torch.float8_e4m3fn)
+        .reshape(experts, columns, rows)
+        .transpose(1, 2)
+    )
+
+    torch.testing.assert_close(
+        actual.backward_data.view(torch.uint8),
+        expected_data.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        actual.backward_scale.view(torch.uint8).reshape(-1),
+        reference.scale_inv.view(torch.uint8).reshape(-1),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_fk_bwd_epi_flag_batch_cli_contract():
