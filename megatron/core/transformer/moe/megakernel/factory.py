@@ -39,10 +39,22 @@ def build_megakernel_backend(
             shared_experts=shared_experts,
             num_local_experts=num_local_experts,
         )
+    if backend == "fk":
+        from megatron.core.transformer.moe.megakernel.fk.backend import FkMegakernel
+
+        return FkMegakernel(
+            config=config,
+            ep_group=ep_group,
+            routed_experts=routed_experts,
+            shared_experts=shared_experts,
+            num_local_experts=num_local_experts,
+        )
     raise ValueError(f"Unsupported MoE megakernel backend: {backend!r}")
 
 
-def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> TransformerConfig:
+def prepare_megakernel_shared_expert_config(
+    config: TransformerConfig,
+) -> TransformerConfig:
     """Return the config used to construct backend-compatible shared experts."""
     backend = config.moe_megakernel_backend
     if backend is None:
@@ -53,6 +65,10 @@ def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> Transf
         )
 
         return prepare_shared_expert_config(config)
+    if backend == "fk":
+        # FK replaces only the routed path. Shared experts retain the original
+        # MCore MXFP8 module, parameter, autograd, and optimizer behavior.
+        return config
     raise ValueError(f"Unsupported MoE megakernel backend: {backend!r}")
 
 
@@ -67,4 +83,6 @@ def megakernel_shared_expert_init_context(config: TransformerConfig):
         # MOK consumes native BF16 shared weights. Disable any model-wide TE
         # fp8_model_init context while the authoritative MCore module is built.
         return get_fp8_disabled_context(config, is_init=True)
+    if backend == "fk":
+        return nullcontext()
     raise ValueError(f"Unsupported MoE megakernel backend: {backend!r}")

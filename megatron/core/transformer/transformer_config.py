@@ -806,7 +806,7 @@ class TransformerConfig(ModelParallelConfig):
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
 
     MCore remains responsible for routing, trainable parameters, distributed-data-parallel
-    state, optimizer state, and checkpoints. Supported values: None and "mok".
+    state, optimizer state, and checkpoints. Supported values: None, "mok", and "fk".
     """
 
     mok_fwd_num_comm_sms: int = 40
@@ -826,6 +826,21 @@ class TransformerConfig(ModelParallelConfig):
 
     mok_all_gather_top_experts_chunk_bytes: int = 2048
     """Chunk size for MoK symmetric-memory expert-ID all-gather."""
+
+    fk_expert_rank_capacity_factor: float = 1.0625
+    """Per-expert-rank route capacity used by the FK 128-row padding adapter."""
+
+    fk_fwd_group_hint: int = 256
+    """Static scheduling group hint used by the FK forward kernel."""
+
+    fk_fwd_col_quant_num_ctas: int = 2368
+    """Number of persistent CTAs used by FK's forward column requantization."""
+
+    fk_bwd_token_back_mode: str = "standalone_warps"
+    """FK backward token-return implementation."""
+
+    fk_bwd_epi_flag_batch: Tuple[int, int] = (1, 1)
+    """FK backward epilogue flag batching tuple."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -2148,14 +2163,17 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_single_grouped_weight is currently supported with high-precision "
                     "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
                 )
-            if not self.use_transformer_engine_op_fuser and self.moe_megakernel_backend != "mok":
+            if not self.use_transformer_engine_op_fuser and self.moe_megakernel_backend not in (
+                "mok",
+                "fk",
+            ):
                 raise ValueError(
                     "moe_single_grouped_weight requires "
                     "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
                     "path splits the grouped parameter into per-expert tensors and does not "
-                    "support single-grouped-weight training. The MOK integration is the only "
-                    "exception because it consumes the grouped parameter directly and never "
-                    "calls the TE GroupedLinear forward path."
+                    "support single-grouped-weight training. MOK and FK are exceptions because "
+                    "they consume the grouped parameter directly and never call the TE "
+                    "GroupedLinear forward path."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
@@ -2223,9 +2241,9 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
-        if self.moe_megakernel_backend not in (None, "mok"):
+        if self.moe_megakernel_backend not in (None, "mok", "fk"):
             raise ValueError(
-                "moe_megakernel_backend must be None or 'mok', got "
+                "moe_megakernel_backend must be None, 'mok', or 'fk', got "
                 f"{self.moe_megakernel_backend!r}"
             )
 
@@ -2256,6 +2274,46 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK does not support latent MoE")
             if not self.gated_linear_unit or self.activation_func != F.silu:
                 raise ValueError("MOK currently requires SwiGLU")
+
+        if self.moe_megakernel_backend == "fk":
+            if not self.gradient_accumulation_fusion:
+                raise ValueError("FK currently requires gradient_accumulation_fusion=True")
+            fk_mxfp8 = (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            )
+            if not fk_mxfp8:
+                raise ValueError("FK routed experts require MXFP8 with fp8_param=True")
+            if not self.moe_single_grouped_weight:
+                raise ValueError("FK currently requires moe_single_grouped_weight=True")
+            if self.moe_mlp_glu_interleave_size != 32:
+                raise ValueError("FK currently requires moe_mlp_glu_interleave_size=32")
+            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError("FK currently requires TP=1 and expert TP=1")
+            if self.expert_model_parallel_size not in (8, 16, 32, 64):
+                raise ValueError("FK requires EP in {8, 16, 32, 64}")
+            if self.moe_shared_expert_intermediate_size is None:
+                raise ValueError("FK requires a native MCore shared expert")
+            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
+                raise ValueError("FK does not support the MCore shared-expert gate/overlap yet")
+            if self.moe_latent_size is not None:
+                raise ValueError("FK does not support latent MoE")
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError("FK currently requires SwiGLU")
+            if self.fk_expert_rank_capacity_factor <= 1.0:
+                raise ValueError("fk_expert_rank_capacity_factor must be greater than 1.0")
+            if self.fk_fwd_group_hint <= 0 or self.fk_fwd_col_quant_num_ctas <= 0:
+                raise ValueError("FK forward scheduling values must be positive")
+            if self.fk_bwd_token_back_mode != "standalone_warps":
+                raise ValueError("FK MVP requires fk_bwd_token_back_mode='standalone_warps'")
+            if len(self.fk_bwd_epi_flag_batch) != 2 or any(
+                value <= 0 for value in self.fk_bwd_epi_flag_batch
+            ):
+                raise ValueError("fk_bwd_epi_flag_batch must contain two positive integers")
+            if self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "FK Proxy MVP does not support CUDA Graph yet; use "
+                    "cuda_graph_impl='none' until the dedicated graph stage"
+                )
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
