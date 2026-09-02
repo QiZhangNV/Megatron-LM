@@ -77,6 +77,13 @@ class _FkAutograd(torch.autograd.Function):
         forward_context.preactivation.grouped_tensor_scale_inv = False
         forward_context.fc1_x_data.grouped_tensor_scale_inv = False
         forward_context.fc1_x_scale.grouped_tensor_scale_inv = True
+        # The first paged-stash iteration profiles the PP schedule before the
+        # reusable CUDA page buffers exist.  Temporarily stage these large FK
+        # contexts on host during that one profiling iteration so Full Model
+        # can bootstrap; steady-state capture/replay still uses CUDA page stash.
+        forward_context.preactivation.paged_stash_capture_to_host = True
+        forward_context.fc1_x_data.paged_stash_capture_to_host = True
+        forward_context.fc1_x_scale.paged_stash_capture_to_host = True
 
         ctx.module = module
         ctx.runtime = runtime

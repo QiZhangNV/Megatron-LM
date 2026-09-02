@@ -21,6 +21,7 @@ from megatron.core.transformer.moe.megakernel.fk.route_padding import (
     build_route_padding_tensors,
     calculate_local_route_capacity,
 )
+from megatron.core.transformer.moe.paged_stash import PagedStashManager
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.argument_utils import ArgumentGroupFactory
 
@@ -523,7 +524,12 @@ def test_fk_autograd_accumulates_bf16_main_grads_and_returns_input_grads(monkeyp
     top_experts = torch.zeros((2, 2), dtype=torch.int64)
     def pack(tensor):
         if hasattr(tensor, "grouped_tensor_scale_inv"):
-            paged_stash_tags.append(tensor.grouped_tensor_scale_inv)
+            paged_stash_tags.append(
+                (
+                    tensor.grouped_tensor_scale_inv,
+                    tensor.paged_stash_capture_to_host,
+                )
+            )
         return tensor
 
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
@@ -549,4 +555,31 @@ def test_fk_autograd_accumulates_bf16_main_grads_and_returns_input_grads(monkeyp
     )
     assert module.routed_fc1_weight.grad_added_to_main_grad
     assert module.routed_fc2_weight.grad_added_to_main_grad
-    assert Counter(paged_stash_tags) == Counter({False: 2, True: 1})
+    assert Counter(paged_stash_tags) == Counter(
+        {(False, True): 2, (True, True): 1}
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_paged_stash_capture_host_round_trip_preserves_cuda_tensor():
+    manager = PagedStashManager()
+    manager.status = "capture"
+    manager.max_num_tokens = 64
+    manager.num_tokens_tensor = torch.tensor(48, dtype=torch.int64, device="cuda")
+    manager.avg_num_tokens = 48
+    manager.current_vp_stage = 0
+
+    tensor = torch.arange(64 * 8, dtype=torch.float32, device="cuda").view(64, 8)
+    tensor.grouped_tensor_scale_inv = False
+    tensor.paged_stash_capture_to_host = True
+
+    packed = manager.on_save_for_backward(tensor)
+    assert packed.capture_to_host
+    assert packed._tensor.device.type == "cpu"
+    assert packed.device.type == "cuda"
+
+    restored = manager.on_get_saved_tensor(packed)
+    assert restored.device.type == "cuda"
+    assert restored.shape == tensor.shape
+    torch.testing.assert_close(restored[:48], tensor[:48])
+    torch.testing.assert_close(restored[48:], torch.zeros_like(restored[48:]))

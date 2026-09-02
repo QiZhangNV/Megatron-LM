@@ -145,6 +145,8 @@ class PagedTensor:
         max_num_tokens=None,
         hidden_size=None,
         page_size=64,
+        capture_to_host=False,
+        original_device=None,
     ):
         """
         Args:
@@ -171,12 +173,13 @@ class PagedTensor:
         self.max_num_tokens = max_num_tokens
         self.hidden_size = hidden_size
         self.page_size = page_size
+        self.capture_to_host = capture_to_host
 
         # Original tensor information
         self.original_shape = list(tensor.shape) if original_shape is None else original_shape
         self.element_size = tensor.element_size()
         self.dtype = tensor.dtype
-        self.device = tensor.device
+        self.device = tensor.device if original_device is None else original_device
 
         # Calculate number of pages needed
         self.max_num_pages = (self.max_num_tokens + page_size - 1) // page_size  # Ceiling division
@@ -692,6 +695,8 @@ class PagedStashManager:
         assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
 
         original_shape = tensor.shape
+        original_device = tensor.device
+        capture_to_host = bool(getattr(tensor, 'paged_stash_capture_to_host', False))
         columnwise_scale_inv = tensor.grouped_tensor_scale_inv
         tensor = tensor.flatten()
         dtype = tensor.dtype
@@ -745,8 +750,18 @@ class PagedStashManager:
             # the saved tensor to actual num_tokens
             new_size = (actual_num_tokens * hidden_size,)
 
-            tensor_truncated = torch.empty(new_size, dtype=dtype, device=tensor.device)
-            tensor_truncated.copy_(tensor[: actual_num_tokens * hidden_size])
+            tensor_slice = tensor[: actual_num_tokens * hidden_size]
+            if capture_to_host:
+                # The capture-profiling iteration has not allocated the reusable
+                # page buffers yet.  Large backend-owned contexts can opt into a
+                # synchronous host copy so profiling the PP schedule itself does
+                # not require every outstanding context to remain resident.
+                # This path runs only while status == 'capture'; steady-state
+                # graph capture/replay continues to use the CUDA stash buffers.
+                tensor_truncated = tensor_slice.to(device='cpu')
+            else:
+                tensor_truncated = torch.empty(new_size, dtype=dtype, device=tensor.device)
+                tensor_truncated.copy_(tensor_slice)
             tensor = tensor_truncated
 
         tensor.grouped_tensor_scale_inv = columnwise_scale_inv
@@ -766,6 +781,8 @@ class PagedStashManager:
             max_num_tokens=self.max_num_tokens,
             hidden_size=hidden_size,
             page_size=self.page_size,
+            capture_to_host=capture_to_host,
+            original_device=original_device,
         )
 
         if self.status == 'captured':
@@ -797,6 +814,9 @@ class PagedStashManager:
                         if not columnwise_scale_inv
                         else int(saved_state.avg_num_tokens) // SCALE_INV_BLOCK_SIZE
                     )
+
+                if saved_state.capture_to_host:
+                    saved_state._tensor = saved_state._tensor.to(device=saved_state.device)
 
                 # Handle 1-byte tensors (torch.uint8)
                 dtype = saved_state._tensor.dtype
