@@ -18,6 +18,7 @@ from megatron.core.transformer.moe.megakernel.fk import weights as fk_weights
 from megatron.core.transformer.moe.megakernel.fk.route_padding import (
     FK_ROUTE_ALIGNMENT,
     build_route_padding_plan,
+    build_route_padding_tensors,
     calculate_local_route_capacity,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -329,6 +330,53 @@ def test_fk_route_padding_is_aligned_fixed_capacity_and_distinct():
         tuple(original + dummy_counts[expert] for expert, original in enumerate(counts))
         == plan.padded_counts
     )
+
+
+def test_fk_tensor_route_padding_matches_host_targets_and_preserves_deficits():
+    ep_size = 16
+    num_experts = 96
+    num_local_tokens = 4096
+    topk = 6
+    num_local_experts = num_experts // ep_size
+    counts = [4096] * num_experts
+    for ep_rank in range(ep_size):
+        begin = ep_rank * num_local_experts
+        counts[begin] += 63
+        counts[begin + 1] -= 63
+        counts[begin + 2] += 17
+        counts[begin + 3] -= 17
+    capacity = calculate_local_route_capacity(
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        num_local_experts=num_local_experts,
+        capacity_factor=1.0625,
+    )
+    reference = build_route_padding_plan(
+        counts,
+        ep_size=ep_size,
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        local_capacity=capacity,
+    )
+
+    padded_counts, dummy_experts = build_route_padding_tensors(
+        torch.tensor(counts, dtype=torch.int64),
+        ep_size=ep_size,
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        local_capacity=capacity,
+    )
+
+    assert padded_counts.tolist() == list(reference.padded_counts)
+    assert dummy_experts.shape == (
+        ep_size,
+        capacity // topk - num_local_tokens,
+        topk,
+    )
+    sorted_rows = dummy_experts.sort(dim=-1).values
+    assert torch.all(sorted_rows.diff(dim=-1) != 0)
+    dummy_counts = torch.bincount(dummy_experts.reshape(-1), minlength=num_experts)
+    assert torch.equal(torch.tensor(counts) + dummy_counts, padded_counts)
 
 
 def test_fk_route_padding_reports_destination_rank_overflow():

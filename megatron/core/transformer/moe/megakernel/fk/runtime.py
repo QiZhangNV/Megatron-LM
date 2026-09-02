@@ -22,8 +22,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from megatron.core.transformer.moe.megakernel.fk.route_padding import (
-    RoutePaddingPlan,
-    build_route_padding_plan,
+    build_route_padding_tensors,
     calculate_local_route_capacity,
 )
 from megatron.core.transformer.moe.megakernel.fk.weights import FkWeightView
@@ -82,8 +81,8 @@ class _PaddedRoutes:
     router_weights: torch.Tensor
     top_experts: torch.Tensor
     local_counts: torch.Tensor
+    padded_counts: torch.Tensor
     original_tokens: int
-    plan: RoutePaddingPlan
 
 
 @dataclass
@@ -478,28 +477,25 @@ class FkRuntime:
         if top_experts.dtype != torch.int64:
             raise TypeError("FK compact expert indices must be int64")
         invalid = (top_experts < 0) | (top_experts >= self.config.num_experts)
-        if bool(invalid.any().item()):
-            raise RuntimeError(
-                "FK MVP requires exactly topk valid expert indices per token"
-            )
+        torch._assert_async(
+            torch.logical_not(invalid.any()),
+            "FK MVP requires exactly topk valid expert indices per token",
+        )
         self._debug("pad_routes_before_counts_all_reduce")
         counts = torch.bincount(
             top_experts.flatten(), minlength=self.config.num_experts
         )
         dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=self.ep_group)
-        self._debug("pad_routes_after_counts_all_reduce", synchronize=True)
-        plan = build_route_padding_plan(
-            counts.cpu().tolist(),
+        self._debug("pad_routes_after_counts_all_reduce")
+        padded_counts, dummy_experts_by_source_rank = build_route_padding_tensors(
+            counts,
             ep_size=self.ep_size,
             num_local_tokens=self.num_local_tokens,
             topk=self.config.topk,
             local_capacity=self.local_capacity,
         )
-        dummy_flat = plan.dummy_experts_by_source_rank[self.ep_rank]
-        dummy_tokens = plan.padded_num_local_tokens - self.num_local_tokens
-        dummy_experts = torch.tensor(
-            dummy_flat, dtype=torch.int64, device=self.device
-        ).reshape(dummy_tokens, self.config.topk)
+        dummy_tokens = self.padded_num_local_tokens - self.num_local_tokens
+        dummy_experts = dummy_experts_by_source_rank[self.ep_rank]
         padded_activation = torch.cat(
             (
                 activation,
@@ -523,16 +519,16 @@ class FkRuntime:
             dim=0,
         )
         padded_experts = torch.cat((top_experts, dummy_experts), dim=0)
-        local_counts = torch.tensor(
-            plan.local_counts(self.ep_rank), dtype=torch.int32, device=self.device
-        )
+        local_counts = padded_counts.reshape(
+            self.ep_size, self.config.num_local_experts
+        )[self.ep_rank].to(torch.int32)
         return _PaddedRoutes(
             activation=padded_activation,
             router_weights=padded_weights,
             top_experts=padded_experts,
             local_counts=local_counts,
+            padded_counts=padded_counts,
             original_tokens=self.num_local_tokens,
-            plan=plan,
         )
 
     def _stage_row_quant(
@@ -645,11 +641,11 @@ class FkRuntime:
         quantized = self._stage_row_quant(
             routes.activation, runner.my_activation, runner.my_activation_sf
         )
-        counts = torch.tensor(
-            routes.plan.padded_counts, device=self.device, dtype=torch.int64
-        )
+        counts = routes.padded_counts.to(torch.int64)
         runner._global_topk_idx = torch.repeat_interleave(
-            torch.arange(self.config.num_experts, device=self.device), counts
+            torch.arange(self.config.num_experts, device=self.device),
+            counts,
+            output_size=self.ep_size * t * k,
         ).reshape(self.ep_size, t, k)
         self._ep_barrier()
         runner.run_kernel()

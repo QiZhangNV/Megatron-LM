@@ -8,6 +8,8 @@ import math
 from dataclasses import dataclass
 from typing import Sequence
 
+import torch
+
 
 FK_ROUTE_ALIGNMENT = 128
 
@@ -178,3 +180,123 @@ def build_route_padding_plan(
         padded_num_local_tokens=padded_num_local_tokens,
         topk=topk,
     )
+
+
+def build_route_padding_tensors(
+    global_counts: torch.Tensor,
+    *,
+    ep_size: int,
+    num_local_tokens: int,
+    topk: int,
+    local_capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the equivalent padding plan without synchronizing to the host.
+
+    The returned tensors are ``padded_counts[num_experts]`` and
+    ``dummy_experts[ep_size, dummy_tokens_per_rank, topk]``.  All tensor
+    dimensions are fixed by the model configuration, so this path can be used
+    from a CUDA Graph after the surrounding distributed rendezvous is made
+    capture-safe.
+
+    Dummy routes are scheduled by flattening each expert's deficit into one
+    contiguous occurrence range and assigning occurrence ``p`` to token
+    ``p % num_dummy_tokens``.  Since a valid expert deficit cannot exceed the
+    number of dummy tokens, one expert never appears twice in a token row.
+    The flattened range has exactly ``num_dummy_tokens * topk`` entries, so
+    every token receives exactly ``topk`` distinct experts.
+    """
+    if global_counts.ndim != 1:
+        raise ValueError(
+            f"FK global route counts must be one-dimensional, got {global_counts.shape}"
+        )
+    num_experts = global_counts.numel()
+    if ep_size <= 0 or num_experts % ep_size:
+        raise ValueError("FK global expert count must be divisible by EP size")
+    if local_capacity % FK_ROUTE_ALIGNMENT or local_capacity % topk:
+        raise ValueError(
+            "FK local route capacity must be divisible by both 128 and topk"
+        )
+
+    original_local_routes = num_local_tokens * topk
+    if local_capacity <= original_local_routes:
+        raise ValueError(
+            f"FK local route capacity {local_capacity} must exceed {original_local_routes}"
+        )
+
+    counts = global_counts.to(torch.int64)
+    expected_routes = ep_size * original_local_routes
+    torch._assert_async(
+        torch.all(counts >= 0), "FK route counts must be non-negative"
+    )
+    torch._assert_async(
+        counts.sum() == expected_routes,
+        "FK requires exactly topk valid routes per token",
+    )
+
+    num_local_experts = num_experts // ep_size
+    capacity_blocks = local_capacity // FK_ROUTE_ALIGNMENT
+    base_blocks = torch.div(
+        counts + FK_ROUTE_ALIGNMENT - 1,
+        FK_ROUTE_ALIGNMENT,
+        rounding_mode="floor",
+    ).reshape(ep_size, num_local_experts)
+    torch._assert_async(
+        torch.all(base_blocks.sum(dim=1) <= capacity_blocks),
+        "FK expert-rank route capacity overflow",
+    )
+
+    # Vectorized water filling.  This is equivalent to repeatedly adding one
+    # 128-row block to the currently smallest expert target, but it launches a
+    # fixed set of tensor operations instead of branching on device values.
+    levels = torch.arange(
+        capacity_blocks + 1, dtype=base_blocks.dtype, device=counts.device
+    )
+    totals_by_level = torch.maximum(
+        base_blocks.unsqueeze(-1), levels.reshape(1, 1, -1)
+    ).sum(dim=1)
+    feasible_levels = torch.where(
+        totals_by_level <= capacity_blocks,
+        levels.reshape(1, -1),
+        torch.full_like(totals_by_level, -1),
+    )
+    water_level = feasible_levels.amax(dim=1).clamp_min(0)
+    padded_blocks = torch.maximum(base_blocks, water_level.unsqueeze(1))
+    remaining_blocks = capacity_blocks - padded_blocks.sum(dim=1)
+
+    expert_indices = torch.arange(
+        num_local_experts, dtype=base_blocks.dtype, device=counts.device
+    ).reshape(1, -1)
+    order = torch.argsort(
+        padded_blocks * (num_local_experts + 1) + expert_indices, dim=1
+    )
+    increments_in_order = (
+        torch.arange(num_local_experts, device=counts.device).reshape(1, -1)
+        < remaining_blocks.unsqueeze(1)
+    ).to(base_blocks.dtype)
+    increments = torch.zeros_like(padded_blocks).scatter(
+        1, order, increments_in_order
+    )
+    padded_counts = ((padded_blocks + increments) * FK_ROUTE_ALIGNMENT).reshape(-1)
+
+    deficits = padded_counts - counts
+    dummy_tokens_per_rank = local_capacity // topk - num_local_tokens
+    total_dummy_tokens = ep_size * dummy_tokens_per_rank
+    total_dummy_routes = total_dummy_tokens * topk
+    torch._assert_async(
+        torch.all(deficits >= 0), "FK padded expert counts must cover real routes"
+    )
+    torch._assert_async(
+        torch.all(deficits <= total_dummy_tokens),
+        "FK route padding cannot form distinct dummy expert rows",
+    )
+    expert_ids = torch.arange(num_experts, dtype=torch.int64, device=counts.device)
+    expanded = torch.repeat_interleave(
+        expert_ids, deficits, output_size=total_dummy_routes
+    )
+    dummy_experts = (
+        expanded.reshape(topk, total_dummy_tokens)
+        .transpose(0, 1)
+        .reshape(ep_size, dummy_tokens_per_rank, topk)
+        .contiguous()
+    )
+    return padded_counts, dummy_experts
