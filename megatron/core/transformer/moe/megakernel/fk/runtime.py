@@ -294,7 +294,10 @@ def _raw_cudnn_operands(
     if transpose:
         matrix = matrix.T
     scale_count = math.ceil(features / 128) * 128 * (total_tokens // 32)
-    scale = scales.view(torch.uint8)[:scale_count].view(
+    # Forward exposes a flat SF workspace while the backward runner exposes
+    # the same byte layout through a 2D auxiliary tensor. Flatten before
+    # truncating so both representations produce the cuDNN (M, K / 32) view.
+    scale = scales.view(torch.uint8).reshape(-1)[:scale_count].view(
         math.ceil(features / 128) * 128, -1
     )
     return matrix, scale.view(torch.float8_e8m0fnu)

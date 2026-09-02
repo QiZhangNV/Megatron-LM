@@ -74,6 +74,30 @@ def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
     assert calls == ["mxfp8_e4m3"]
 
 
+def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
+    total_tokens = 64
+    features = 128
+    data = torch.zeros((total_tokens, features), dtype=torch.uint8)
+    scale_workspace = torch.arange(10 * features, dtype=torch.int32).to(
+        torch.uint8
+    ).reshape(10, features)
+
+    matrix, scale = fk_runtime._raw_cudnn_operands(
+        data,
+        scale_workspace,
+        total_tokens,
+        features,
+        transpose=True,
+    )
+
+    assert matrix.shape == (features, total_tokens)
+    assert scale.shape == (features, total_tokens // 32)
+    torch.testing.assert_close(
+        scale.view(torch.uint8).reshape(-1),
+        scale_workspace.reshape(-1)[: features * (total_tokens // 32)],
+    )
+
+
 def test_fk_bwd_epi_flag_batch_cli_contract():
     field_name = "fk_bwd_epi_flag_batch"
     exclude = [
