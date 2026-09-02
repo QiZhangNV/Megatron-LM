@@ -190,6 +190,8 @@ def test_fk_native_mxfp8_columnwise_view_matches_transpose_quantization(monkeypa
         "device": "cuda",
     }
     supported = inspect.signature(te.GroupedLinear.__init__).parameters
+    if "single_grouped_weight" not in supported:
+        pytest.skip("installed Transformer Engine lacks single grouped weight support")
     constructor_kwargs = {
         key: value for key, value in constructor_kwargs.items() if key in supported
     }
