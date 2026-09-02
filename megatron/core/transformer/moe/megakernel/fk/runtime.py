@@ -388,7 +388,7 @@ class FkRuntime:
                 dtype=torch.uint8,
                 device=self.device,
             ).view(torch.float8_e8m0fnu)
-            output = torch.empty(
+            output = torch.zeros(
                 (self.config.num_local_experts, out_features, in_features),
                 dtype=torch.bfloat16,
                 device=self.device,
@@ -404,7 +404,9 @@ class FkRuntime:
                 acc_dtype=torch.float32,
                 wgrad_dtype=torch.bfloat16,
                 sf_vec_size=32,
-                accumulate_on_output=False,
+                # Compile the exact mode used by training before FK replaces
+                # the image-owned CuTeDSL modules in sys.modules.
+                accumulate_on_output=True,
                 current_stream=torch.cuda.current_stream().cuda_stream,
             )
             torch.cuda.synchronize()
