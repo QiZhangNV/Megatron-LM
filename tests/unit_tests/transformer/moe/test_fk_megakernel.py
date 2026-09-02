@@ -114,6 +114,34 @@ def test_fk_reused_kernel_is_bracketed_by_ep_barriers():
     assert events == ["barrier", ("kernel", {"value": 7}), "barrier"]
 
 
+def test_fk_ep_barrier_uses_only_stream_ordered_nvshmem_during_capture(monkeypatch):
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    runtime.ep_group = object()
+    stream = object()
+    events = []
+    nvshmem = types.SimpleNamespace(
+        barrier_all=lambda actual_stream: events.append(("nvshmem", actual_stream))
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: events.append("cuda_synchronize")
+    )
+    monkeypatch.setattr(
+        fk_runtime.dist, "barrier", lambda **kwargs: events.append(("dist", kwargs))
+    )
+    monkeypatch.setattr(
+        fk_runtime,
+        "_prepare_system_dependencies",
+        lambda: types.SimpleNamespace(nvshmem=nvshmem),
+    )
+
+    runtime._ep_barrier()
+
+    assert events == [("nvshmem", stream)]
+
+
 def test_fk_columnwise_payload_transpose_reuses_cached_storage(monkeypatch):
     experts, rows, columns = 2, 4, 6
     row_data = torch.arange(experts * rows * columns, dtype=torch.uint8).reshape(
@@ -271,12 +299,18 @@ def test_fk_bwd_epi_flag_batch_cli_contract():
         ({"moe_mlp_glu_interleave_size": None}, "interleave_size=32"),
         ({"expert_model_parallel_size": 4}, "EP in"),
         ({"moe_shared_expert_overlap": True}, "shared-expert gate/overlap"),
-        ({"cuda_graph_impl": "local"}, "does not support CUDA Graph"),
+        ({"cuda_graph_impl": "local"}, "supports only cuda_graph_impl"),
     ],
 )
 def test_fk_backend_rejects_unsupported_configuration(override, message):
     with pytest.raises(ValueError, match=message):
         _fk_transformer_config(**override)
+
+
+def test_fk_backend_accepts_full_iteration_cuda_graph():
+    config = _fk_transformer_config(cuda_graph_impl="full_iteration")
+
+    assert config.cuda_graph_impl == "full_iteration"
 
 
 def test_fk_shared_expert_keeps_native_mxfp8_config():

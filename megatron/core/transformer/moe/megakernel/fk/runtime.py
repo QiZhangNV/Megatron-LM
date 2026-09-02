@@ -390,9 +390,19 @@ class FkRuntime:
         )
 
     def _ep_barrier(self) -> None:
+        stream = torch.cuda.current_stream()
+        if torch.cuda.is_current_stream_capturing():
+            # Full-iteration CUDA graphs already give every rank a fixed launch
+            # order.  A synchronous ProcessGroupNCCL barrier cannot be used
+            # here: capture records the collective without executing it, while
+            # the Python wait would block for work that only runs on replay.
+            # Keep the stream-ordered NVSHMEM rendezvous in the graph so peer
+            # communication workspaces remain separated between FK launches.
+            _prepare_system_dependencies().nvshmem.barrier_all(stream)
+            return
         torch.cuda.synchronize()
         dist.barrier(group=self.ep_group)
-        _prepare_system_dependencies().nvshmem.barrier_all(torch.cuda.current_stream())
+        _prepare_system_dependencies().nvshmem.barrier_all(stream)
         torch.cuda.synchronize()
 
     def _launch_distributed_kernel(self, compiled_kernel, kwargs) -> None:

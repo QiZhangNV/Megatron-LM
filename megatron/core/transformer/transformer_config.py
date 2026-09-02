@@ -2311,10 +2311,10 @@ class TransformerConfig(ModelParallelConfig):
                 value <= 0 for value in self.fk_bwd_epi_flag_batch
             ):
                 raise ValueError("fk_bwd_epi_flag_batch must contain two positive integers")
-            if self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(
-                    "FK Proxy MVP does not support CUDA Graph yet; use "
-                    "cuda_graph_impl='none' until the dedicated graph stage"
+                    "FK currently supports only cuda_graph_impl='none' or "
+                    "cuda_graph_impl='full_iteration'"
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
