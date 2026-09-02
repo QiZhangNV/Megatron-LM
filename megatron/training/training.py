@@ -2841,6 +2841,50 @@ def dummy_train_step(data_iterator):
             )
 
 
+@torch.no_grad()
+def _debug_grad_norm_breakdown(model) -> None:
+    """Print opt-in pre-clip gradient norms grouped by MoE parameter role."""
+    if os.environ.get("MCORE_DEBUG_GRAD_NORM_BREAKDOWN", "0") != "1":
+        return
+
+    category_squares = {
+        name: torch.zeros((), dtype=torch.float64, device=torch.cuda.current_device())
+        for name in ("routed_fc1", "routed_fc2", "shared_expert", "router", "other")
+    }
+    seen_params = set()
+    for model_chunk in model:
+        for param_name, param in unwrap_model(model_chunk).named_parameters():
+            if id(param) in seen_params:
+                continue
+            seen_params.add(id(param))
+            grad = getattr(param, "main_grad", None)
+            if grad is None:
+                grad = param.grad
+            if grad is None:
+                continue
+            if ".experts.linear_fc1." in param_name:
+                category = "routed_fc1"
+            elif ".experts.linear_fc2." in param_name:
+                category = "routed_fc2"
+            elif ".shared_experts." in param_name:
+                category = "shared_expert"
+            elif ".router." in param_name:
+                category = "router"
+            else:
+                category = "other"
+            category_squares[category] += grad.detach().float().square().sum(dtype=torch.float64)
+
+    for square_sum in category_squares.values():
+        torch.distributed.all_reduce(square_sum, group=torch.distributed.group.WORLD)
+    if torch.distributed.get_rank() == 0:
+        values = " ".join(
+            f"{name}={float(square_sum.sqrt().item()):.9e}"
+            for name, square_sum in category_squares.items()
+        )
+        total = torch.stack(tuple(category_squares.values())).sum().sqrt().item()
+        print(f"MCORE_GRAD_NORM_BREAKDOWN {values} all={total:.9e}", flush=True)
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -3114,6 +3158,8 @@ def train_step(
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
+
+    _debug_grad_norm_breakdown(model)
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
