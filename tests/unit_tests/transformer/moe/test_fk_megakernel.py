@@ -142,6 +142,14 @@ def test_fk_ep_barrier_uses_only_stream_ordered_nvshmem_during_capture(monkeypat
     assert events == [("nvshmem", stream)]
 
 
+def test_fk_route_counts_match_bincount_without_host_state():
+    top_experts = torch.tensor([[3, 1, 5], [0, 3, 1], [4, 5, 3]])
+
+    counts = fk_runtime._count_routes(top_experts, num_experts=8)
+
+    assert torch.equal(counts, torch.bincount(top_experts.flatten(), minlength=8))
+
+
 def test_fk_columnwise_payload_transpose_reuses_cached_storage(monkeypatch):
     experts, rows, columns = 2, 4, 6
     row_data = torch.arange(experts * rows * columns, dtype=torch.uint8).reshape(

@@ -261,6 +261,15 @@ def _group_quantize(
     )
 
 
+def _count_routes(top_experts: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Count compact routes without ``torch.bincount`` host-side capture state."""
+    flat_experts = top_experts.reshape(-1)
+    counts = torch.zeros(num_experts, dtype=torch.int64, device=top_experts.device)
+    return counts.scatter_add_(
+        0, flat_experts, torch.ones_like(flat_experts, dtype=torch.int64)
+    )
+
+
 def _unswizzle_row_scales(
     scale_inv: torch.Tensor, rows: int, columns: int
 ) -> torch.Tensor:
@@ -492,9 +501,7 @@ class FkRuntime:
             "FK MVP requires exactly topk valid expert indices per token",
         )
         self._debug("pad_routes_before_counts_all_reduce")
-        counts = torch.bincount(
-            top_experts.flatten(), minlength=self.config.num_experts
-        )
+        counts = _count_routes(top_experts, self.config.num_experts)
         dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=self.ep_group)
         self._debug("pad_routes_after_counts_all_reduce")
         padded_counts, dummy_experts_by_source_rank = build_route_padding_tensors(
