@@ -2851,8 +2851,9 @@ def _debug_grad_norm_breakdown(model) -> None:
         name: torch.zeros((), dtype=torch.float64, device=torch.cuda.current_device())
         for name in ("routed_fc1", "routed_fc2", "shared_expert", "router", "other")
     }
+    moe_param_squares = {}
     seen_params = set()
-    for model_chunk in model:
+    for model_chunk_id, model_chunk in enumerate(model):
         for param_name, param in unwrap_model(model_chunk).named_parameters():
             if id(param) in seen_params:
                 continue
@@ -2872,7 +2873,10 @@ def _debug_grad_norm_breakdown(model) -> None:
                 category = "router"
             else:
                 category = "other"
-            category_squares[category] += grad.detach().float().square().sum(dtype=torch.float64)
+            square_sum = grad.detach().float().square().sum(dtype=torch.float64)
+            category_squares[category] += square_sum
+            if category != "other":
+                moe_param_squares[f"chunk{model_chunk_id}.{param_name}"] = square_sum
 
     for square_sum in category_squares.values():
         torch.distributed.all_reduce(square_sum, group=torch.distributed.group.WORLD)
@@ -2883,6 +2887,15 @@ def _debug_grad_norm_breakdown(model) -> None:
         )
         total = torch.stack(tuple(category_squares.values())).sum().sqrt().item()
         print(f"MCORE_GRAD_NORM_BREAKDOWN {values} all={total:.9e}", flush=True)
+    for param_name in sorted(moe_param_squares):
+        square_sum = moe_param_squares[param_name]
+        torch.distributed.all_reduce(square_sum, group=torch.distributed.group.WORLD)
+        if torch.distributed.get_rank() == 0:
+            print(
+                "MCORE_GRAD_PARAM_NORM "
+                f"name={param_name} norm={float(square_sum.sqrt().item()):.9e}",
+                flush=True,
+            )
 
 
 def train_step(
