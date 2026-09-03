@@ -98,6 +98,33 @@ def test_fk_cute_compile_uses_node_scoped_lock(monkeypatch, tmp_path):
     ]
 
 
+def test_fk_cute_compile_materializes_launcher_before_releasing_ir(monkeypatch):
+    events = []
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+
+    class Compiled:
+        def __init__(self):
+            self.ir_module = object()
+            self.jit_module = None
+
+        def to(self, device):
+            events.append(("to", device, self.ir_module is not None))
+            self.jit_module = object()
+            return object()
+
+    compiled = Compiled()
+    monkeypatch.setattr(
+        fk_runtime, "_trim_process_heap", lambda: events.append("trim")
+    )
+
+    result = fk_runtime._compile_with_node_lock("forward", lambda: compiled)
+
+    assert result is compiled
+    assert compiled.jit_module is not None
+    assert compiled.ir_module is None
+    assert events == [("to", None, True), "trim"]
+
+
 def test_fk_vendor_compile_wrapper_restores_cute_compile(monkeypatch):
     cutlass = types.ModuleType("cutlass")
     cutlass.__path__ = []

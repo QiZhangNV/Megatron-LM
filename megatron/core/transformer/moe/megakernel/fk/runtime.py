@@ -9,6 +9,7 @@ shape, scopes NVSHMEM to that EP group, and supplies real MCore tensors.
 from __future__ import annotations
 
 import atexit
+import ctypes
 import fcntl
 import gc
 import math
@@ -154,6 +155,43 @@ def _compile_lock_path() -> str:
     return os.path.join(root, safe(job), f"{safe(node)}.lock")
 
 
+def _current_rss_mib() -> float | None:
+    """Read current process RSS without retaining profiler state."""
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as statm:
+            resident_pages = int(statm.read().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _trim_process_heap() -> bool:
+    """Return free glibc arenas to the node after an MLIR compilation."""
+    try:
+        malloc_trim = ctypes.CDLL(None).malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        return bool(malloc_trim(0))
+    except (AttributeError, OSError):
+        return False
+
+
+def _materialize_and_release_cute_ir(compiled: Any) -> bool:
+    """Load a CuTe launcher, then release the MLIR module it no longer needs."""
+    ir_module = getattr(compiled, "ir_module", None)
+    materialize = getattr(compiled, "to", None)
+    if ir_module is None or not callable(materialize):
+        return False
+
+    # JitCompiledFunction.to() builds jit_module and loads device kernels from
+    # ir_module without launching the distributed kernel. Future __call__ uses
+    # that materialized jit_module, so the very large MLIR context can be
+    # released before the next local rank enters compilation.
+    materialize(None)
+    compiled.ir_module = None
+    return True
+
+
 def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
     """Run one memory-intensive CuTe compile at a time on each physical node.
 
@@ -163,7 +201,11 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
     released before the runner enters its distributed launch barriers.
     """
     if _local_world_size() <= 1:
-        return compile_fn(*args, **kwargs)
+        compiled = compile_fn(*args, **kwargs)
+        _materialize_and_release_cute_ir(compiled)
+        gc.collect()
+        _trim_process_heap()
+        return compiled
 
     lock_path = _compile_lock_path()
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
@@ -186,17 +228,31 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
             f"wait_seconds={compile_start - wait_start:.3f}",
             flush=True,
         )
+        rss_after_compile = None
+        materialized = False
         try:
-            return compile_fn(*args, **kwargs)
+            compiled = compile_fn(*args, **kwargs)
+            rss_after_compile = _current_rss_mib()
+            materialized = _materialize_and_release_cute_ir(compiled)
+            return compiled
         finally:
             # Drop compiler IR cycles before allowing the next local rank to
-            # enter its peak, while retaining the returned compiled launcher.
+            # enter its peak, while retaining the materialized launcher.
             gc.collect()
+            heap_trimmed = _trim_process_heap()
+            rss_after_cleanup = _current_rss_mib()
             elapsed = time.monotonic() - compile_start
+            rss_fields = (
+                ""
+                if rss_after_compile is None or rss_after_cleanup is None
+                else f" rss_after_compile_mib={rss_after_compile:.1f} "
+                f"rss_after_cleanup_mib={rss_after_cleanup:.1f}"
+            )
             print(
                 f"FK_MCORE_COMPILE label={label} event=released "
                 f"node={node} local_rank={local_rank} "
-                f"compile_seconds={elapsed:.3f}",
+                f"compile_seconds={elapsed:.3f} materialized={materialized} "
+                f"heap_trimmed={heap_trimmed}{rss_fields}",
                 flush=True,
             )
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
