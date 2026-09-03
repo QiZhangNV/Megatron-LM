@@ -34,13 +34,11 @@ def calculate_local_route_capacity(
     """
     if num_local_tokens <= 0 or topk <= 0 or num_local_experts <= 0:
         raise ValueError("FK route-capacity dimensions must be positive")
-    if capacity_factor <= 1.0:
-        raise ValueError("FK route capacity factor must be greater than 1.0")
+    if capacity_factor < 1.0:
+        raise ValueError("FK route capacity factor must be at least 1.0")
     alignment = math.lcm(FK_ROUTE_ALIGNMENT * num_local_experts, topk)
     requested = math.ceil(num_local_tokens * topk * capacity_factor)
     capacity = _round_up(requested, alignment)
-    if capacity <= num_local_tokens * topk:
-        capacity += alignment
     return capacity
 
 
@@ -124,9 +122,9 @@ def build_route_padding_plan(
             "FK local route capacity must be divisible by both 128 and topk"
         )
     original_local_routes = num_local_tokens * topk
-    if local_capacity <= original_local_routes:
+    if local_capacity < original_local_routes:
         raise ValueError(
-            f"FK local route capacity {local_capacity} must exceed {original_local_routes}"
+            f"FK local route capacity {local_capacity} must cover {original_local_routes}"
         )
 
     num_local_experts = len(counts) // ep_size
@@ -218,9 +216,9 @@ def build_route_padding_tensors(
         )
 
     original_local_routes = num_local_tokens * topk
-    if local_capacity <= original_local_routes:
+    if local_capacity < original_local_routes:
         raise ValueError(
-            f"FK local route capacity {local_capacity} must exceed {original_local_routes}"
+            f"FK local route capacity {local_capacity} must cover {original_local_routes}"
         )
 
     counts = global_counts.to(torch.int64)

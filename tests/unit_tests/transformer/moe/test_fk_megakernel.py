@@ -60,6 +60,14 @@ def test_fk_backend_accepts_mvp_configuration():
     assert config.moe_mlp_glu_interleave_size == 32
 
 
+def test_fk_backend_accepts_exact_route_capacity_and_rejects_under_capacity():
+    config = _fk_transformer_config(fk_expert_rank_capacity_factor=1.0)
+
+    assert config.fk_expert_rank_capacity_factor == 1.0
+    with pytest.raises(ValueError, match="at least 1.0"):
+        _fk_transformer_config(fk_expert_rank_capacity_factor=0.999)
+
+
 def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
     calls = []
     common = types.ModuleType("common")
@@ -568,6 +576,42 @@ def test_fk_route_padding_is_aligned_fixed_capacity_and_distinct():
         tuple(original + dummy_counts[expert] for expert, original in enumerate(counts))
         == plan.padded_counts
     )
+
+
+def test_fk_exact_capacity_skips_padding_for_aligned_balanced_routes():
+    ep_size = 16
+    num_experts = 96
+    num_local_tokens = 4096
+    topk = 6
+    counts = [4096] * num_experts
+    capacity = calculate_local_route_capacity(
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        num_local_experts=num_experts // ep_size,
+        capacity_factor=1.0,
+    )
+
+    assert capacity == num_local_tokens * topk
+    plan = build_route_padding_plan(
+        counts,
+        ep_size=ep_size,
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        local_capacity=capacity,
+    )
+    assert plan.padded_num_local_tokens == num_local_tokens
+    assert plan.padded_counts == tuple(counts)
+    assert all(not rank_routes for rank_routes in plan.dummy_experts_by_source_rank)
+
+    padded_counts, dummy_experts = build_route_padding_tensors(
+        torch.tensor(counts, dtype=torch.int64),
+        ep_size=ep_size,
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        local_capacity=capacity,
+    )
+    assert padded_counts.tolist() == counts
+    assert dummy_experts.shape == (ep_size, 0, topk)
 
 
 def test_fk_tensor_route_padding_matches_host_targets_and_preserves_deficits():

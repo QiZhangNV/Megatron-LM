@@ -828,7 +828,12 @@ class TransformerConfig(ModelParallelConfig):
     """Chunk size for MoK symmetric-memory expert-ID all-gather."""
 
     fk_expert_rank_capacity_factor: float = 1.0625
-    """Per-expert-rank route capacity used by the FK 128-row padding adapter."""
+    """Per-expert-rank route capacity used by the FK 128-row padding adapter.
+
+    A value of 1.0 is valid when routing is exactly balanced and every expert's
+    route count already satisfies FK's 128-row alignment.  Unbalanced routing
+    still requires enough headroom to cover per-expert padding.
+    """
 
     fk_fwd_group_hint: int = 256
     """Static scheduling group hint used by the FK forward kernel."""
@@ -2309,8 +2314,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("FK does not support latent MoE")
             if not self.gated_linear_unit or self.activation_func != F.silu:
                 raise ValueError("FK currently requires SwiGLU")
-            if self.fk_expert_rank_capacity_factor <= 1.0:
-                raise ValueError("fk_expert_rank_capacity_factor must be greater than 1.0")
+            if self.fk_expert_rank_capacity_factor < 1.0:
+                raise ValueError("fk_expert_rank_capacity_factor must be at least 1.0")
             if self.fk_fwd_group_hint <= 0 or self.fk_fwd_col_quant_num_ctas <= 0:
                 raise ValueError("FK forward scheduling values must be positive")
             supported_fk_token_back_modes = {
