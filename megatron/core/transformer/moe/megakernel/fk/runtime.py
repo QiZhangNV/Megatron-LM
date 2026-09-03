@@ -215,6 +215,19 @@ def _compile_artifact_identity(
     )
 
 
+def _share_cute_aot_object(label: str, ordinal: int) -> bool:
+    """Whether this position returns only a launchable FK kernel.
+
+    The pinned forward and backward runners first compile Cutlass DSL's
+    HardwareInfo probe, then inspect its artifacts.CUBIN metadata. An AOT
+    reload intentionally retains only the callable binary, so that auxiliary
+    compile must preserve the original object on every rank. Their second
+    compile and the standalone columnwise requant compile are the heavyweight
+    FK kernels that are safe to share.
+    """
+    return label not in {"forward", "backward"} or ordinal > 0
+
+
 def _publish_cute_object(compiled: Any, path: str, prefix: str) -> bool:
     """Atomically publish a CuTe callable as an official AOT object."""
     dump_to_object = getattr(compiled, "dump_to_object", None)
@@ -271,6 +284,7 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
     artifact_path, artifact_prefix = _compile_artifact_identity(
         lock_path, label, ordinal
     )
+    share_artifact = _share_cute_aot_object(label, ordinal)
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     local_rank = os.environ.get("LOCAL_RANK") or os.environ.get("SLURM_LOCALID", "?")
     node = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
@@ -293,15 +307,17 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
         materialized = False
         source = "cache"
         try:
-            if os.path.exists(artifact_path):
+            if share_artifact and os.path.exists(artifact_path):
                 compiled = _load_cute_object(artifact_path, artifact_prefix)
                 materialized = True
             else:
                 source = "compile"
                 source_compiled = compile_fn(*args, **kwargs)
                 rss_after_compile = _current_rss_mib()
-                if _publish_cute_object(
-                    source_compiled, artifact_path, artifact_prefix
+                if share_artifact and _publish_cute_object(
+                    source_compiled,
+                    artifact_path,
+                    artifact_prefix,
                 ):
                     # The binary engine keeps only the exported host shim and
                     # cubin. Drop the heavyweight MLIR/LLVM JIT engine before
@@ -314,11 +330,12 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
                 else:
                     compiled = source_compiled
                     materialized = _materialize_and_release_cute_ir(compiled)
-                    source = "compile-no-aot"
+                    source = "compile-no-aot" if share_artifact else "compile-local"
             return compiled
         finally:
             # Drop compiler cycles before allowing the next local rank to enter
-            # its peak, while retaining only the loaded binary launcher.
+            # its peak. Auxiliary probes retain their caller-required metadata;
+            # heavyweight FK kernels retain only the loaded binary launcher.
             gc.collect()
             heap_trimmed = _trim_process_heap()
             rss_after_cleanup = _current_rss_mib()
@@ -334,6 +351,7 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
                 f"node={node} local_rank={local_rank} "
                 f"ordinal={ordinal} source={source} compile_seconds={elapsed:.3f} "
                 f"materialized={materialized} heap_trimmed={heap_trimmed} "
+                f"share_artifact={share_artifact} "
                 f"artifact={artifact_path}{rss_fields}",
                 flush=True,
             )
