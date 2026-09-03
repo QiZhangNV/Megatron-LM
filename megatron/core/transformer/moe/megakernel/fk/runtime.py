@@ -50,6 +50,8 @@ class FkRuntimeConfig:
     fwd_group_hint: int
     fwd_col_quant_num_ctas: int
     direct_col_quant_context: bool
+    fwd_max_active_clusters: int | None
+    bwd_max_active_clusters: int | None
     bwd_token_back_mode: str
     external_barrier_mode: str
     bwd_epi_flag_batch: tuple[int, int]
@@ -69,6 +71,8 @@ class FkRuntimeConfig:
             fwd_group_hint=config.fk_fwd_group_hint,
             fwd_col_quant_num_ctas=config.fk_fwd_col_quant_num_ctas,
             direct_col_quant_context=config.fk_direct_col_quant_context,
+            fwd_max_active_clusters=config.fk_fwd_max_active_clusters,
+            bwd_max_active_clusters=config.fk_bwd_max_active_clusters,
             bwd_token_back_mode=config.fk_bwd_token_back_mode,
             external_barrier_mode=config.fk_external_barrier_mode,
             bwd_epi_flag_batch=tuple(config.fk_bwd_epi_flag_batch),
@@ -388,11 +392,32 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _run_with_node_serialized_cute_compiles(label: str, callback):
-    """Serialize cute.compile calls made inside an unmodified FK runner."""
+def _run_with_node_serialized_cute_compiles(
+    label: str, callback, *, max_active_clusters: int | None = None
+):
+    """Serialize FK compilation and optionally cap its persistent cluster grid."""
     import cutlass.cute as cute
 
     original_compile = cute.compile
+    original_hardware_info = None
+    utils = None
+    if max_active_clusters is not None:
+        import cutlass.utils as utils
+
+        original_hardware_info = utils.HardwareInfo
+
+        class _CappedHardwareInfo:
+            def __init__(self, *args, **kwargs):
+                self._delegate = original_hardware_info(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._delegate, name)
+
+            def get_max_active_clusters(self, cluster_size):
+                detected = self._delegate.get_max_active_clusters(cluster_size)
+                return min(detected, max_active_clusters)
+
+        utils.HardwareInfo = _CappedHardwareInfo
 
     def serialized_compile(*args, **kwargs):
         return _compile_with_node_lock(label, original_compile, *args, **kwargs)
@@ -402,6 +427,8 @@ def _run_with_node_serialized_cute_compiles(label: str, callback):
         return callback()
     finally:
         cute.compile = original_compile
+        if original_hardware_info is not None:
+            utils.HardwareInfo = original_hardware_info
 
 
 def _mxfp8_scale_dtype() -> torch.dtype:
@@ -1016,7 +1043,11 @@ class FkRuntime:
             output_size=self.ep_size * t * k,
         ).reshape(self.ep_size, t, k)
         self._ep_barrier()
-        _run_with_node_serialized_cute_compiles("forward", runner.run_kernel)
+        _run_with_node_serialized_cute_compiles(
+            "forward",
+            runner.run_kernel,
+            max_active_clusters=self.config.fwd_max_active_clusters,
+        )
         self._ep_barrier()
         runner._global_topk_idx = None
         runner._mcore_activation_quant = quantized
@@ -1256,7 +1287,11 @@ class FkRuntime:
             padded_grad_output, runner.my_grad_out, runner.my_grad_out_sf
         )
         runner._dist_barrier = self._ep_barrier
-        _run_with_node_serialized_cute_compiles("backward", runner.run_kernel)
+        _run_with_node_serialized_cute_compiles(
+            "backward",
+            runner.run_kernel,
+            max_active_clusters=self.config.bwd_max_active_clusters,
+        )
         runner._mcore_grad_quant = quantized
         self.backward_runner = runner
         self._compile_col_requant(context.local_counts)

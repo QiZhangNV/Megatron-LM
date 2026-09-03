@@ -233,6 +233,35 @@ def test_fk_vendor_compile_wrapper_restores_cute_compile(monkeypatch):
     assert cute.compile is original_compile
 
 
+def test_fk_vendor_compile_wrapper_caps_and_restores_hardware_info(monkeypatch):
+    cutlass = types.ModuleType("cutlass")
+    cutlass.__path__ = []
+    cute = types.ModuleType("cutlass.cute")
+    cute.compile = lambda value: value
+    utils = types.ModuleType("cutlass.utils")
+
+    class HardwareInfo:
+        def get_max_active_clusters(self, cluster_size):
+            assert cluster_size == 2
+            return 76
+
+    utils.HardwareInfo = HardwareInfo
+    cutlass.cute = cute
+    cutlass.utils = utils
+    monkeypatch.setitem(sys.modules, "cutlass", cutlass)
+    monkeypatch.setitem(sys.modules, "cutlass.cute", cute)
+    monkeypatch.setitem(sys.modules, "cutlass.utils", utils)
+
+    result = fk_runtime._run_with_node_serialized_cute_compiles(
+        "forward",
+        lambda: utils.HardwareInfo().get_max_active_clusters(2),
+        max_active_clusters=72,
+    )
+
+    assert result == 72
+    assert utils.HardwareInfo is HardwareInfo
+
+
 def test_fk_resets_cudnn_dsa_children_and_lazy_symbol_cache(monkeypatch):
     root = types.ModuleType(fk_runtime._CUDNN_DSA_ROOT)
     child = types.ModuleType(f"{fk_runtime._CUDNN_DSA_ROOT}.utils.compiler")
@@ -527,6 +556,8 @@ def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
     [
         ({"fk_bwd_token_back_mode": "epi_warps"}, "fk_bwd_token_back_mode"),
         ({"fk_external_barrier_mode": "sometimes"}, "fk_external_barrier_mode"),
+        ({"fk_fwd_max_active_clusters": 0}, "active cluster"),
+        ({"fk_bwd_max_active_clusters": -1}, "active cluster"),
     ],
 )
 def test_fk_backend_rejects_unsupported_performance_mode(override, message):

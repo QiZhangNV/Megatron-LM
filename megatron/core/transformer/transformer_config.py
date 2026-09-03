@@ -848,6 +848,12 @@ class TransformerConfig(ModelParallelConfig):
     forward. The conservative copy path remains available for A/B validation.
     """
 
+    fk_fwd_max_active_clusters: Optional[int] = None
+    """Optional FK forward persistent-cluster cap; None uses all active clusters."""
+
+    fk_bwd_max_active_clusters: Optional[int] = None
+    """Optional FK backward persistent-cluster cap; None uses all active clusters."""
+
     fk_bwd_token_back_mode: str = "standalone_warps"
     """FK backward token-return implementation."""
 
@@ -2325,6 +2331,14 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("fk_expert_rank_capacity_factor must be at least 1.0")
             if self.fk_fwd_group_hint <= 0 or self.fk_fwd_col_quant_num_ctas <= 0:
                 raise ValueError("FK forward scheduling values must be positive")
+            if any(
+                limit is not None and limit <= 0
+                for limit in (
+                    self.fk_fwd_max_active_clusters,
+                    self.fk_bwd_max_active_clusters,
+                )
+            ):
+                raise ValueError("FK max active cluster limits must be positive")
             supported_fk_token_back_modes = {
                 "standalone_warps",
                 "reuse_dispatch_warps",
