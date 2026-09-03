@@ -68,6 +68,15 @@ def test_fk_backend_accepts_exact_route_capacity_and_rejects_under_capacity():
         _fk_transformer_config(fk_expert_rank_capacity_factor=0.999)
 
 
+def test_fk_direct_col_quant_context_reaches_runtime_config():
+    config = _fk_transformer_config(fk_direct_col_quant_context=True)
+    runtime_config = fk_runtime.FkRuntimeConfig.from_transformer_config(
+        config, num_local_experts=1
+    )
+
+    assert runtime_config.direct_col_quant_context
+
+
 def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
     calls = []
     common = types.ModuleType("common")

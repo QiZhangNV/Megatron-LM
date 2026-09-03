@@ -49,6 +49,7 @@ class FkRuntimeConfig:
     swiglu_limit: float | None
     fwd_group_hint: int
     fwd_col_quant_num_ctas: int
+    direct_col_quant_context: bool
     bwd_token_back_mode: str
     external_barrier_mode: str
     bwd_epi_flag_batch: tuple[int, int]
@@ -67,6 +68,7 @@ class FkRuntimeConfig:
             swiglu_limit=config.activation_func_clamp_value,
             fwd_group_hint=config.fk_fwd_group_hint,
             fwd_col_quant_num_ctas=config.fk_fwd_col_quant_num_ctas,
+            direct_col_quant_context=config.fk_direct_col_quant_context,
             bwd_token_back_mode=config.fk_bwd_token_back_mode,
             external_barrier_mode=config.fk_external_barrier_mode,
             bwd_epi_flag_batch=tuple(config.fk_bwd_epi_flag_batch),
@@ -911,6 +913,19 @@ class FkRuntime:
         runner.my_fc2_weight = fc2.forward_data
         runner.my_fc2_weight_sf = fc2.forward_scale
 
+    def _allocate_col_quant_context(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Allocate the exact per-call FC1 wgrad inputs written by FK forward."""
+        data = torch.empty(
+            (self.local_capacity, self.config.hidden_size),
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        scale_count = (
+            math.ceil(self.config.hidden_size / 128) * 128 * (self.local_capacity // 32)
+        )
+        scale = torch.empty((scale_count,), dtype=torch.uint8, device=self.device)
+        return data, scale
+
     def _build_forward_runner(
         self, routes: _PaddedRoutes, fc1: FkWeightView, fc2: FkWeightView
     ) -> None:
@@ -1016,6 +1031,8 @@ class FkRuntime:
         output: torch.Tensor,
         preactivation: torch.Tensor,
         route_index: torch.Tensor,
+        col_quant_data: torch.Tensor | None = None,
+        col_quant_scale: torch.Tensor | None = None,
     ) -> None:
         import cuda.bindings.driver as cuda
 
@@ -1034,6 +1051,13 @@ class FkRuntime:
         kwargs["output_activation"] = _to_cute(output)
         kwargs["fc1_c"] = _to_cute(preactivation)
         kwargs["fc1_c_route_index"] = _to_cute(route_index, assumed_align=4)
+        if (col_quant_data is None) != (col_quant_scale is None):
+            raise RuntimeError(
+                "FK direct col-quant data and scale must be supplied together"
+            )
+        if col_quant_data is not None:
+            kwargs["col_quant_data"] = _to_cute(col_quant_data)
+            kwargs["col_quant_sf"] = _to_cute(col_quant_scale)
         kwargs["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self._debug("update_forward_before_kernel")
         self._launch_distributed_kernel(runner._compiled_kernel, kwargs)
@@ -1052,6 +1076,8 @@ class FkRuntime:
         self._debug("forward_enter")
         routes = self._pad_routes(activation, router_weights, top_experts)
         self._debug("forward_after_pad_routes")
+        fc1_x_data = None
+        fc1_x_scale = None
         if self.forward_runner is None:
             self._debug("forward_before_build_runner")
             self._build_forward_runner(routes, fc1, fc2)
@@ -1060,6 +1086,14 @@ class FkRuntime:
             output = runner.output_activation
             preactivation = runner._c_output
             route_index = runner._c_route_index
+            if self.config.direct_col_quant_context:
+                fc1_x_data = runner.col_quant_data[: self.local_capacity]
+                sf_count = (
+                    math.ceil(self.config.hidden_size / 128)
+                    * 128
+                    * (self.local_capacity // 32)
+                )
+                fc1_x_scale = runner.col_quant_sf.view(torch.uint8)[:sf_count]
         else:
             output = torch.zeros(
                 (self.padded_num_local_tokens, self.config.hidden_size),
@@ -1076,6 +1110,8 @@ class FkRuntime:
                 dtype=torch.int32,
                 device=self.device,
             )
+            if self.config.direct_col_quant_context:
+                fc1_x_data, fc1_x_scale = self._allocate_col_quant_context()
             self._update_forward_runtime(
                 routes,
                 fc1,
@@ -1083,6 +1119,8 @@ class FkRuntime:
                 output=output,
                 preactivation=preactivation,
                 route_index=route_index,
+                col_quant_data=fc1_x_data,
+                col_quant_scale=fc1_x_scale,
             )
         self._debug("forward_before_context_copy")
         if preactivation.shape[0] != self.local_capacity:
@@ -1090,13 +1128,20 @@ class FkRuntime:
                 "FK forward preactivation capacity mismatch: "
                 f"got={preactivation.shape[0]}, expected={self.local_capacity}"
             )
-        sf_count = (
-            math.ceil(self.config.hidden_size / 128) * 128 * (self.local_capacity // 32)
-        )
-        fc1_x_data = self.forward_runner.col_quant_data[: self.local_capacity].clone()
-        fc1_x_scale = self.forward_runner.col_quant_sf.view(torch.uint8)[
-            :sf_count
-        ].clone()
+        if not self.config.direct_col_quant_context:
+            sf_count = (
+                math.ceil(self.config.hidden_size / 128)
+                * 128
+                * (self.local_capacity // 32)
+            )
+            fc1_x_data = self.forward_runner.col_quant_data[
+                : self.local_capacity
+            ].clone()
+            fc1_x_scale = self.forward_runner.col_quant_sf.view(torch.uint8)[
+                :sf_count
+            ].clone()
+        if fc1_x_data is None or fc1_x_scale is None:
+            raise RuntimeError("FK forward did not produce FC1 wgrad context")
         fc1_x_metadata = None
         if self._debug_enabled:
             fc1_x_metadata = self._workspace_view(

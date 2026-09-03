@@ -841,6 +841,13 @@ class TransformerConfig(ModelParallelConfig):
     fk_fwd_col_quant_num_ctas: int = 2368
     """Number of persistent CTAs used by FK's forward column requantization."""
 
+    fk_direct_col_quant_context: bool = False
+    """Let FK write FC1 wgrad inputs directly into per-call autograd buffers.
+
+    This avoids copying the shared runner column-quantization output after each
+    forward. The conservative copy path remains available for A/B validation.
+    """
+
     fk_bwd_token_back_mode: str = "standalone_warps"
     """FK backward token-return implementation."""
 
