@@ -48,6 +48,7 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     TorchFullyShardedDataParallelConfig,
     finalize_model_grads,
+    warmup_router_expert_bias_communicator,
 )
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as megatron_FSDP,
@@ -4223,6 +4224,7 @@ def train(
     # used by those paths before the first forward pass.
     if args.num_experts is not None and getattr(args, "moe_paged_stash", False):
         warmup_moe_metrics_pipeline_communicator(model_pg_collection)
+        warmup_router_expert_bias_communicator(config, model_pg_collection)
         if optimizer is not None:
             optimizer.warmup_grad_stats_parallel_communicators()
 

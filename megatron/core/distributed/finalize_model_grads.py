@@ -451,6 +451,41 @@ maintain for legacy tests. We can remove this proxy in mcore 0.14.
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
+def _get_router_expert_bias_group(
+    config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection]
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Return the group used to aggregate router expert-bias token counts."""
+    if not config.moe_router_enable_expert_bias:
+        return None
+    if pg_collection is not None:
+        assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
+            "pg_collection must have tp_dp_cp when moe_router_enable_expert_bias is enabled."
+        )
+        return pg_collection.tp_dp_cp
+    return parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+
+
+@torch.no_grad()
+def warmup_router_expert_bias_communicator(
+    config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+) -> None:
+    """Initialize the router expert-bias communicator before memory-intensive training."""
+    if (
+        not config.moe_router_enable_expert_bias
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        return
+
+    group = _get_router_expert_bias_group(config, pg_collection)
+    if get_pg_size(group) <= 1:
+        return
+
+    warmup_tensor = torch.zeros(1, dtype=torch.float32, device='cuda')
+    torch.distributed.all_reduce(warmup_tensor, group=group)
+    torch.cuda.synchronize()
+
+
 def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
@@ -464,7 +499,7 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
-    tp_dp_cp_group = None
+    tp_dp_cp_group = _get_router_expert_bias_group(config, pg_collection)
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
         assert hasattr(pg_collection, 'pp')
@@ -483,11 +518,6 @@ def finalize_model_grads(
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
         assert hasattr(pg_collection, 'dp_cp')
-        if config.moe_router_enable_expert_bias:
-            assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
-                "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
-            )
-            tp_dp_cp_group = pg_collection.tp_dp_cp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
         embd_group = pg_collection.embd
@@ -541,10 +571,6 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
-        if pg_collection is None:
-            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
-                with_context_parallel=True
-            )
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     reset_model_temporary_tensors(config, model)

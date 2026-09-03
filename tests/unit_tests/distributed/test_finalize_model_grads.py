@@ -12,6 +12,7 @@ from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
     finalize_model_grads,
+    warmup_router_expert_bias_communicator,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -76,6 +77,15 @@ class TestFinalizeModelGradsMoEExpertBias:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_warmup_router_expert_bias_communicator_with_custom_group(self):
+        assert not parallel_state.model_parallel_is_initialized()
+        config = _router_expert_bias_config()
+
+        warmup_router_expert_bias_communicator(
+            config, _router_bias_pg_collection(tp_dp_cp=dist.group.WORLD)
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_finalize_model_grads_updates_router_expert_bias_with_custom_group(self):
