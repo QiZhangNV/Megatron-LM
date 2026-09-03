@@ -201,31 +201,51 @@ def _next_compile_ordinal(label: str) -> int:
 
 
 def _compile_artifact_identity(
-    lock_path: str, label: str, ordinal: int
+    lock_path: str,
+    label: str,
+    ordinal: int,
+    *,
+    scope: str,
+    local_rank: str,
 ) -> tuple[str, str]:
-    """Name the node-local AOT handoff for one compile sequence position."""
+    """Name an AOT handoff for one compile sequence position and scope."""
     safe_label = "".join(
         character if character.isalnum() or character == "_" else "_"
         for character in label
     )
+    safe_rank = "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in local_rank
+    )
+    rank_suffix = f".rank-{safe_rank}" if scope == "rank" else ""
+    prefix_suffix = f"_rank_{safe_rank}" if scope == "rank" else ""
     lock_stem = os.path.splitext(lock_path)[0]
     return (
-        f"{lock_stem}.{safe_label}.{ordinal}.o",
-        f"fk_mcore_{safe_label}_{ordinal}",
+        f"{lock_stem}.{safe_label}.{ordinal}{rank_suffix}.o",
+        f"fk_mcore_{safe_label}_{ordinal}{prefix_suffix}",
     )
 
 
-def _share_cute_aot_object(label: str, ordinal: int) -> bool:
-    """Whether this position returns only a launchable FK kernel.
+def _cute_aot_scope(label: str, ordinal: int) -> str | None:
+    """Return the safe AOT reuse scope for a compiled callable.
 
     The pinned forward and backward runners first compile Cutlass DSL's
     HardwareInfo probe, then inspect its artifacts.CUBIN metadata. An AOT
     reload intentionally retains only the callable binary, so that auxiliary
-    compile must preserve the original object on every rank. Their second
-    compile and the standalone columnwise requant compile are the heavyweight
-    FK kernels that are safe to share.
+    compile must preserve the original object on every rank.
+
+    The distributed backward kernel embeds rank-local launch state. Sharing
+    its exported object between ranks loads successfully but hangs on the
+    first collective launch. Exporting and reloading each rank's own object
+    still releases the heavyweight compiler state without changing FK. The
+    forward and standalone columnwise requant kernels have been validated as
+    node-shareable.
     """
-    return label not in {"forward", "backward"} or ordinal > 0
+    if label in {"forward", "backward"} and ordinal == 0:
+        return None
+    if label == "backward":
+        return "rank"
+    return "node"
 
 
 def _publish_cute_object(compiled: Any, path: str, prefix: str) -> bool:
@@ -263,14 +283,14 @@ def _load_cute_object(path: str, prefix: str):
 
 
 def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
-    """Compile once per node and load an AOT callable on every local rank.
+    """Serialize node compiles and reload AOT at its validated reuse scope.
 
     A full FK compile can peak near 255 GiB of host RSS. Four simultaneous
     GPU ranks therefore exceed a GB300 node's roughly 900 GiB Slurm memory
     allocation. The node-scoped lock coordinates Cutlass DSL's documented
     ``dump_to_object`` / ``load_module`` handoff without changing the external
-    kernel. The lock is released before the runner enters its distributed
-    launch barriers.
+    kernel. Rank-dependent backward objects are not shared between ranks. The
+    lock is released before the runner enters its distributed launch barriers.
     """
     if _local_world_size() <= 1:
         compiled = compile_fn(*args, **kwargs)
@@ -281,12 +301,16 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
 
     lock_path = _compile_lock_path()
     ordinal = _next_compile_ordinal(label)
-    artifact_path, artifact_prefix = _compile_artifact_identity(
-        lock_path, label, ordinal
-    )
-    share_artifact = _share_cute_aot_object(label, ordinal)
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     local_rank = os.environ.get("LOCAL_RANK") or os.environ.get("SLURM_LOCALID", "?")
+    aot_scope = _cute_aot_scope(label, ordinal)
+    artifact_path, artifact_prefix = _compile_artifact_identity(
+        lock_path,
+        label,
+        ordinal,
+        scope=aot_scope or "node",
+        local_rank=local_rank,
+    )
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     node = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
     wait_start = time.monotonic()
     print(
@@ -307,14 +331,14 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
         materialized = False
         source = "cache"
         try:
-            if share_artifact and os.path.exists(artifact_path):
+            if aot_scope is not None and os.path.exists(artifact_path):
                 compiled = _load_cute_object(artifact_path, artifact_prefix)
                 materialized = True
             else:
                 source = "compile"
                 source_compiled = compile_fn(*args, **kwargs)
                 rss_after_compile = _current_rss_mib()
-                if share_artifact and _publish_cute_object(
+                if aot_scope is not None and _publish_cute_object(
                     source_compiled,
                     artifact_path,
                     artifact_prefix,
@@ -330,7 +354,9 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
                 else:
                     compiled = source_compiled
                     materialized = _materialize_and_release_cute_ir(compiled)
-                    source = "compile-no-aot" if share_artifact else "compile-local"
+                    source = (
+                        "compile-no-aot" if aot_scope is not None else "compile-local"
+                    )
             return compiled
         finally:
             # Drop compiler cycles before allowing the next local rank to enter
@@ -351,7 +377,7 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
                 f"node={node} local_rank={local_rank} "
                 f"ordinal={ordinal} source={source} compile_seconds={elapsed:.3f} "
                 f"materialized={materialized} heap_trimmed={heap_trimmed} "
-                f"share_artifact={share_artifact} "
+                f"aot_scope={aot_scope or 'none'} "
                 f"artifact={artifact_path}{rss_fields}",
                 flush=True,
             )
@@ -372,7 +398,6 @@ def _run_with_node_serialized_cute_compiles(label: str, callback):
         return callback()
     finally:
         cute.compile = original_compile
-
 
 
 def _mxfp8_scale_dtype() -> torch.dtype:
@@ -602,8 +627,10 @@ def _raw_cudnn_operands(
     # Forward exposes a flat SF workspace while the backward runner exposes
     # the same byte layout through a 2D auxiliary tensor. Flatten before
     # truncating so both representations produce the cuDNN (M, K / 32) view.
-    scale = scales.view(torch.uint8).reshape(-1)[:scale_count].view(
-        math.ceil(features / 128) * 128, -1
+    scale = (
+        scales.view(torch.uint8)
+        .reshape(-1)[:scale_count]
+        .view(math.ceil(features / 128) * 128, -1)
     )
     return matrix, scale.view(torch.float8_e8m0fnu)
 

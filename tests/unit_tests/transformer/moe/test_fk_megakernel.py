@@ -90,9 +90,7 @@ def test_fk_cute_compile_uses_node_scoped_lock(monkeypatch, tmp_path):
         calls.append((value, scale))
         return value * scale
 
-    assert fk_runtime._compile_with_node_lock(
-        "forward", compile_fn, 7, scale=6
-    ) == 42
+    assert fk_runtime._compile_with_node_lock("forward", compile_fn, 7, scale=6) == 42
     assert calls == [(7, 6)]
     assert list(tmp_path.glob("645738/*.lock")) == [
         tmp_path / "645738" / "nvl72d117-T01.lock"
@@ -101,12 +99,27 @@ def test_fk_cute_compile_uses_node_scoped_lock(monkeypatch, tmp_path):
     assert list(tmp_path.glob("645738/*.o")) == []
 
 
-def test_fk_cute_aot_sharing_preserves_hardware_info_compile_metadata():
-    assert not fk_runtime._share_cute_aot_object("forward", 0)
-    assert not fk_runtime._share_cute_aot_object("backward", 0)
-    assert fk_runtime._share_cute_aot_object("forward", 1)
-    assert fk_runtime._share_cute_aot_object("backward", 1)
-    assert fk_runtime._share_cute_aot_object("col_requant", 0)
+def test_fk_cute_aot_scope_preserves_metadata_and_rank_local_backward():
+    assert fk_runtime._cute_aot_scope("forward", 0) is None
+    assert fk_runtime._cute_aot_scope("backward", 0) is None
+    assert fk_runtime._cute_aot_scope("forward", 1) == "node"
+    assert fk_runtime._cute_aot_scope("backward", 1) == "rank"
+    assert fk_runtime._cute_aot_scope("col_requant", 0) == "node"
+
+
+def test_fk_cute_aot_rank_scope_uses_distinct_artifact_names(tmp_path):
+    lock_path = str(tmp_path / "job" / "node.lock")
+
+    rank_zero = fk_runtime._compile_artifact_identity(
+        lock_path, "backward", 1, scope="rank", local_rank="0"
+    )
+    rank_one = fk_runtime._compile_artifact_identity(
+        lock_path, "backward", 1, scope="rank", local_rank="1"
+    )
+
+    assert rank_zero != rank_one
+    assert rank_zero[0].endswith("node.backward.1.rank-0.o")
+    assert rank_one[0].endswith("node.backward.1.rank-1.o")
 
 
 def test_fk_cute_compile_materializes_launcher_before_releasing_ir(monkeypatch):
@@ -124,9 +137,7 @@ def test_fk_cute_compile_materializes_launcher_before_releasing_ir(monkeypatch):
             return object()
 
     compiled = Compiled()
-    monkeypatch.setattr(
-        fk_runtime, "_trim_process_heap", lambda: events.append("trim")
-    )
+    monkeypatch.setattr(fk_runtime, "_trim_process_heap", lambda: events.append("trim"))
 
     result = fk_runtime._compile_with_node_lock("forward", lambda: compiled)
 
@@ -205,7 +216,6 @@ def test_fk_vendor_compile_wrapper_restores_cute_compile(monkeypatch):
     assert cute.compile is original_compile
 
 
-
 def test_fk_resets_cudnn_dsa_children_and_lazy_symbol_cache(monkeypatch):
     root = types.ModuleType(fk_runtime._CUDNN_DSA_ROOT)
     child = types.ModuleType(f"{fk_runtime._CUDNN_DSA_ROOT}.utils.compiler")
@@ -229,9 +239,11 @@ def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
     total_tokens = 64
     features = 128
     data = torch.zeros((total_tokens, features), dtype=torch.uint8)
-    scale_workspace = torch.arange(10 * features, dtype=torch.int32).to(
-        torch.uint8
-    ).reshape(10, features)
+    scale_workspace = (
+        torch.arange(10 * features, dtype=torch.int32)
+        .to(torch.uint8)
+        .reshape(10, features)
+    )
 
     matrix, scale = fk_runtime._raw_cudnn_operands(
         data,
@@ -356,9 +368,7 @@ def test_fk_native_mxfp8_columnwise_view_matches_transpose_quantization(monkeypa
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
     experts, rows, columns = 1, 7168, 3072
     torch.manual_seed(1234)
-    source = torch.randn(
-        (experts, rows, columns), device="cuda", dtype=torch.bfloat16
-    )
+    source = torch.randn((experts, rows, columns), device="cuda", dtype=torch.bfloat16)
     recipe = MXFP8BlockScaling(fp8_format=Format.HYBRID)
     constructor_kwargs = {
         "sequence_parallel": False,
@@ -608,7 +618,9 @@ def test_fk_autograd_accumulates_bf16_main_grads_and_returns_input_grads(monkeyp
                 preactivation=torch.zeros((x.shape[0], 8)),
                 route_index=torch.arange(x.shape[0], dtype=torch.int32),
                 fc1_x_data=torch.zeros_like(x, dtype=torch.uint8),
-                fc1_x_scale=torch.zeros((x.shape[0] // 2, x.shape[1]), dtype=torch.uint8),
+                fc1_x_scale=torch.zeros(
+                    (x.shape[0] // 2, x.shape[1]), dtype=torch.uint8
+                ),
                 fc1_x_metadata=None,
             )
             return torch.zeros_like(x), context
@@ -650,6 +662,7 @@ def test_fk_autograd_accumulates_bf16_main_grads_and_returns_input_grads(monkeyp
     x = torch.zeros((2, 4), requires_grad=True)
     router_weights = torch.zeros((2, 2), requires_grad=True)
     top_experts = torch.zeros((2, 2), dtype=torch.int64)
+
     def pack(tensor):
         if hasattr(tensor, "grouped_tensor_scale_inv"):
             paged_stash_tags.append(
@@ -683,9 +696,7 @@ def test_fk_autograd_accumulates_bf16_main_grads_and_returns_input_grads(monkeyp
     )
     assert module.routed_fc1_weight.grad_added_to_main_grad
     assert module.routed_fc2_weight.grad_added_to_main_grad
-    assert Counter(paged_stash_tags) == Counter(
-        {(False, True): 2, (True, True): 1}
-    )
+    assert Counter(paged_stash_tags) == Counter({(False, True): 2, (True, True): 1})
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
