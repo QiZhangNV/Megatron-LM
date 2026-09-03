@@ -409,6 +409,36 @@ class MegatronOptimizer(ABC):
             return self.grad_stats_parallel_group
         return parallel_state.get_model_parallel_group()
 
+    def get_grad_stats_parallel_groups(self) -> List[torch.distributed.ProcessGroup]:
+        """Return every process group used to reduce gradient statistics."""
+        return [self.get_grad_stats_parallel_group()]
+
+    @torch.no_grad()
+    def warmup_grad_stats_parallel_communicators(self) -> None:
+        """Initialize grad-stat NCCL communicators before memory-intensive training.
+
+        Gradient norm and zero-count reductions normally initialize their NCCL
+        communicators during the first optimizer step. Workloads that use paged
+        activation stash can leave too little free device memory at that point,
+        so callers may explicitly initialize the same groups before the first
+        forward pass.
+        """
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return
+
+        groups = [
+            group
+            for group in self.get_grad_stats_parallel_groups()
+            if torch.distributed.get_world_size(group=group) > 1
+        ]
+        if not groups:
+            return
+
+        warmup_tensor = torch.zeros(1, dtype=torch.float32, device='cuda')
+        for group in groups:
+            torch.distributed.all_reduce(warmup_tensor, group=group)
+        torch.cuda.synchronize()
+
     @abstractmethod
     def prepare_grads(self) -> bool:
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
@@ -1915,6 +1945,16 @@ class ChainedOptimizer(MegatronOptimizer):
             "since grads states parallel group are not shared across all optimizers"
         )
         return self.chained_optimizers[0].get_grad_stats_parallel_group()
+
+    def get_grad_stats_parallel_groups(self) -> List[torch.distributed.ProcessGroup]:
+        """Return distinct grad-stat groups used by child optimizers, in execution order."""
+        groups = []
+        for optimizer in self.chained_optimizers:
+            child_groups = optimizer.get_grad_stats_parallel_groups()
+            for group in child_groups:
+                if not any(group is existing_group for existing_group in groups):
+                    groups.append(group)
+        return groups
 
     @torch.no_grad()
     def get_grad_norm(self):

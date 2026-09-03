@@ -1,7 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from unittest.mock import patch
+from contextlib import ExitStack
+from unittest.mock import call, patch
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from transformer_engine.pytorch.fp8 import fp8_autocast
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import (
     ChainedOptimizer,
+    MegatronOptimizer,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
@@ -67,6 +69,110 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+def test_chained_optimizer_warmup_grad_stats_communicators_deduplicates_groups():
+    """Warm up every distinct child grad-stat group exactly once."""
+
+    class MockOptimizer:
+        def __init__(self, config, groups):
+            self.config = config
+            self.groups = groups
+
+        def get_grad_stats_parallel_groups(self):
+            return self.groups
+
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+    group_a = object()
+    group_b = object()
+    optimizer = ChainedOptimizer(
+        [
+            MockOptimizer(config, [group_a]),
+            MockOptimizer(config, [group_a, group_b]),
+        ]
+    )
+    warmup_tensor = object()
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                'megatron.core.optimizer.optimizer.torch.distributed.is_available',
+                return_value=True,
+            )
+        )
+        stack.enter_context(
+            patch(
+                'megatron.core.optimizer.optimizer.torch.distributed.is_initialized',
+                return_value=True,
+            )
+        )
+        stack.enter_context(
+            patch(
+                'megatron.core.optimizer.optimizer.torch.distributed.get_world_size',
+                return_value=2,
+            )
+        )
+        zeros = stack.enter_context(
+            patch('megatron.core.optimizer.optimizer.torch.zeros', return_value=warmup_tensor)
+        )
+        all_reduce = stack.enter_context(
+            patch('megatron.core.optimizer.optimizer.torch.distributed.all_reduce')
+        )
+        synchronize = stack.enter_context(
+            patch('megatron.core.optimizer.optimizer.torch.cuda.synchronize')
+        )
+        optimizer.warmup_grad_stats_parallel_communicators()
+
+    zeros.assert_called_once_with(1, dtype=torch.float32, device='cuda')
+    assert all_reduce.call_args_list == [
+        call(warmup_tensor, group=group_a),
+        call(warmup_tensor, group=group_b),
+    ]
+    synchronize.assert_called_once_with()
+
+
+def test_optimizer_warmup_grad_stats_communicators_skips_single_rank_groups():
+    """Do not allocate a CUDA tensor when no grad-stat group communicates."""
+
+    class MockOptimizer:
+        warmup_grad_stats_parallel_communicators = (
+            MegatronOptimizer.warmup_grad_stats_parallel_communicators
+        )
+
+        def get_grad_stats_parallel_groups(self):
+            return [object()]
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                'megatron.core.optimizer.optimizer.torch.distributed.is_available',
+                return_value=True,
+            )
+        )
+        stack.enter_context(
+            patch(
+                'megatron.core.optimizer.optimizer.torch.distributed.is_initialized',
+                return_value=True,
+            )
+        )
+        stack.enter_context(
+            patch(
+                'megatron.core.optimizer.optimizer.torch.distributed.get_world_size',
+                return_value=1,
+            )
+        )
+        zeros = stack.enter_context(patch('megatron.core.optimizer.optimizer.torch.zeros'))
+        all_reduce = stack.enter_context(
+            patch('megatron.core.optimizer.optimizer.torch.distributed.all_reduce')
+        )
+        synchronize = stack.enter_context(
+            patch('megatron.core.optimizer.optimizer.torch.cuda.synchronize')
+        )
+        MockOptimizer().warmup_grad_stats_parallel_communicators()
+
+    zeros.assert_not_called()
+    all_reduce.assert_not_called()
+    synchronize.assert_not_called()
 
 
 @patch('torch.distributed.get_world_size', return_value=1)

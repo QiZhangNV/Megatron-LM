@@ -4217,12 +4217,14 @@ def train(
     model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
 
     # Page-stash workloads can consume nearly all free device memory during the
-    # first step.  MoE logging otherwise initializes its PP NCCL communicator at
-    # the end of that step, where even the communicator's small internal buffer
-    # allocation can OOM.  Warm up the same group before activation stashing
-    # reaches its peak.
+    # first step. MoE logging and gradient-stat reductions otherwise initialize
+    # their NCCL communicators after activation stashing reaches its peak, where
+    # even communicator-internal allocations can OOM. Warm up the exact groups
+    # used by those paths before the first forward pass.
     if args.num_experts is not None and getattr(args, "moe_paged_stash", False):
         warmup_moe_metrics_pipeline_communicator(model_pg_collection)
+        if optimizer is not None:
+            optimizer.warmup_grad_stats_parallel_communicators()
 
     # Tracking loss.
     total_loss_dict = {}
