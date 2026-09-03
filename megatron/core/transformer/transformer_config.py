@@ -839,6 +839,14 @@ class TransformerConfig(ModelParallelConfig):
     fk_bwd_token_back_mode: str = "standalone_warps"
     """FK backward token-return implementation."""
 
+    fk_external_barrier_mode: str = "pre_and_post"
+    """External EP rendezvous around reused FK kernel launches.
+
+    ``pre_and_post`` preserves the conservative initial integration behavior,
+    ``pre`` keeps one rendezvous before each launch, and ``none`` relies on the
+    FK kernel-tail back-to-back launch protocol.
+    """
+
     fk_bwd_epi_flag_batch: Tuple[int, int] = field(
         default=(1, 1), metadata={"argparse_meta": {"type": int, "nargs": 2}}
     )
@@ -2305,8 +2313,21 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("fk_expert_rank_capacity_factor must be greater than 1.0")
             if self.fk_fwd_group_hint <= 0 or self.fk_fwd_col_quant_num_ctas <= 0:
                 raise ValueError("FK forward scheduling values must be positive")
-            if self.fk_bwd_token_back_mode != "standalone_warps":
-                raise ValueError("FK MVP requires fk_bwd_token_back_mode='standalone_warps'")
+            supported_fk_token_back_modes = {
+                "standalone_warps",
+                "reuse_dispatch_warps",
+            }
+            if self.fk_bwd_token_back_mode not in supported_fk_token_back_modes:
+                raise ValueError(
+                    "fk_bwd_token_back_mode must be one of "
+                    f"{sorted(supported_fk_token_back_modes)}"
+                )
+            supported_fk_external_barrier_modes = {"pre_and_post", "pre", "none"}
+            if self.fk_external_barrier_mode not in supported_fk_external_barrier_modes:
+                raise ValueError(
+                    "fk_external_barrier_mode must be one of "
+                    f"{sorted(supported_fk_external_barrier_modes)}"
+                )
             if len(self.fk_bwd_epi_flag_batch) != 2 or any(
                 value <= 0 for value in self.fk_bwd_epi_flag_batch
             ):

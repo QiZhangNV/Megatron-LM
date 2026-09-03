@@ -50,6 +50,7 @@ class FkRuntimeConfig:
     fwd_group_hint: int
     fwd_col_quant_num_ctas: int
     bwd_token_back_mode: str
+    external_barrier_mode: str
     bwd_epi_flag_batch: tuple[int, int]
 
     @classmethod
@@ -67,6 +68,7 @@ class FkRuntimeConfig:
             fwd_group_hint=config.fk_fwd_group_hint,
             fwd_col_quant_num_ctas=config.fk_fwd_col_quant_num_ctas,
             bwd_token_back_mode=config.fk_bwd_token_back_mode,
+            external_barrier_mode=config.fk_external_barrier_mode,
             bwd_epi_flag_batch=tuple(config.fk_bwd_epi_flag_batch),
         )
 
@@ -686,7 +688,9 @@ class FkRuntime:
                 f"ep={self.ep_size} tokens={num_local_tokens} "
                 f"padded_tokens={self.padded_num_local_tokens} "
                 f"local_route_capacity={self.local_capacity} "
-                f"capacity_factor={config.capacity_factor}",
+                f"capacity_factor={config.capacity_factor} "
+                f"token_back={config.bwd_token_back_mode} "
+                f"external_barrier={config.external_barrier_mode}",
                 flush=True,
             )
 
@@ -738,10 +742,19 @@ class FkRuntime:
         torch.cuda.synchronize()
 
     def _launch_distributed_kernel(self, compiled_kernel, kwargs) -> None:
-        """Launch a reused FK kernel with the vendor runner's rendezvous protocol."""
-        self._ep_barrier()
+        """Launch a reused FK kernel with the selected external rendezvous policy.
+
+        FK's production kernel tail drains peer writes and publishes reset shared
+        counters so the next launch can safely reuse the symmetric workspace.
+        The conservative policy remains the default while allowing end-to-end
+        workloads to measure one or zero additional adapter-owned barriers.
+        """
+        barrier_mode = self.config.external_barrier_mode
+        if barrier_mode in ("pre_and_post", "pre"):
+            self._ep_barrier()
         compiled_kernel(**kwargs)
-        self._ep_barrier()
+        if barrier_mode == "pre_and_post":
+            self._ep_barrier()
 
     def _precompile_wgrads(self, cudnn_wgrad) -> None:
         counts = torch.full(

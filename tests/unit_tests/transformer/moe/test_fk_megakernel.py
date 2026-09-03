@@ -261,8 +261,17 @@ def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
     )
 
 
-def test_fk_reused_kernel_is_bracketed_by_ep_barriers():
+@pytest.mark.parametrize(
+    ("barrier_mode", "expected"),
+    [
+        ("pre_and_post", ["barrier", ("kernel", {"value": 7}), "barrier"]),
+        ("pre", ["barrier", ("kernel", {"value": 7})]),
+        ("none", [("kernel", {"value": 7})]),
+    ],
+)
+def test_fk_reused_kernel_external_barrier_modes(barrier_mode, expected):
     runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    runtime.config = types.SimpleNamespace(external_barrier_mode=barrier_mode)
     events = []
     runtime._ep_barrier = lambda: events.append("barrier")
 
@@ -271,7 +280,7 @@ def test_fk_reused_kernel_is_bracketed_by_ep_barriers():
 
     runtime._launch_distributed_kernel(compiled_kernel, {"value": 7})
 
-    assert events == ["barrier", ("kernel", {"value": 7}), "barrier"]
+    assert events == expected
 
 
 def test_fk_ep_barrier_uses_only_stream_ordered_nvshmem_during_capture(monkeypatch):
@@ -477,6 +486,35 @@ def test_fk_backend_accepts_full_iteration_cuda_graph():
     config = _fk_transformer_config(cuda_graph_impl="full_iteration")
 
     assert config.cuda_graph_impl == "full_iteration"
+
+
+@pytest.mark.parametrize(
+    "token_back_mode",
+    ["standalone_warps", "reuse_dispatch_warps"],
+)
+def test_fk_backend_accepts_supported_token_back_modes(token_back_mode):
+    config = _fk_transformer_config(fk_bwd_token_back_mode=token_back_mode)
+
+    assert config.fk_bwd_token_back_mode == token_back_mode
+
+
+@pytest.mark.parametrize("barrier_mode", ["pre_and_post", "pre", "none"])
+def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
+    config = _fk_transformer_config(fk_external_barrier_mode=barrier_mode)
+
+    assert config.fk_external_barrier_mode == barrier_mode
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"fk_bwd_token_back_mode": "epi_warps"}, "fk_bwd_token_back_mode"),
+        ({"fk_external_barrier_mode": "sometimes"}, "fk_external_barrier_mode"),
+    ],
+)
+def test_fk_backend_rejects_unsupported_performance_mode(override, message):
+    with pytest.raises(ValueError, match=message):
+        _fk_transformer_config(**override)
 
 
 def test_fk_shared_expert_keeps_native_mxfp8_config():
