@@ -109,6 +109,7 @@ _SYSTEM_DEPS: _SystemDependencies | None = None
 _FK_PACKAGES_SELECTED = False
 _NVSHMEM_STATE: tuple[tuple[int, ...], int] | None = None
 _RUNTIME_CACHE: dict[tuple[Any, ...], "FkRuntime"] = {}
+_COMPILE_ORDINALS: dict[str, int] = {}
 
 _CUDNN_DSA_ROOT = "cudnn.deepseek_sparse_attention"
 
@@ -192,13 +193,71 @@ def _materialize_and_release_cute_ir(compiled: Any) -> bool:
     return True
 
 
+def _next_compile_ordinal(label: str) -> int:
+    """Return this process's ordinal for a rank-identical compile sequence."""
+    ordinal = _COMPILE_ORDINALS.get(label, 0)
+    _COMPILE_ORDINALS[label] = ordinal + 1
+    return ordinal
+
+
+def _compile_artifact_identity(
+    lock_path: str, label: str, ordinal: int
+) -> tuple[str, str]:
+    """Name the node-local AOT handoff for one compile sequence position."""
+    safe_label = "".join(
+        character if character.isalnum() or character == "_" else "_"
+        for character in label
+    )
+    lock_stem = os.path.splitext(lock_path)[0]
+    return (
+        f"{lock_stem}.{safe_label}.{ordinal}.o",
+        f"fk_mcore_{safe_label}_{ordinal}",
+    )
+
+
+def _publish_cute_object(compiled: Any, path: str, prefix: str) -> bool:
+    """Atomically publish a CuTe callable as an official AOT object."""
+    dump_to_object = getattr(compiled, "dump_to_object", None)
+    if not callable(dump_to_object):
+        return False
+
+    payload = dump_to_object(prefix)
+    temporary_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(temporary_path, "wb") as object_file:
+            object_file.write(payload)
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
+    return True
+
+
+def _load_cute_object(path: str, prefix: str):
+    """Load and materialize a callable through Cutlass DSL's public AOT API."""
+    from cutlass.cute import export as cute_export  # noqa: F401
+    from cutlass.runtime import load_module
+
+    external_module = load_module(path)
+    compiled = external_module[prefix]
+    compiled.to(None)
+    # Keep the documented module lifetime explicit even though the returned
+    # callable also owns the same BinaryExecutionEngine.
+    compiled._mcore_external_binary_module = external_module
+    return compiled
+
+
 def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
-    """Run one memory-intensive CuTe compile at a time on each physical node.
+    """Compile once per node and load an AOT callable on every local rank.
 
     A full FK compile can peak near 255 GiB of host RSS. Four simultaneous
     GPU ranks therefore exceed a GB300 node's roughly 900 GiB Slurm memory
-    allocation. The lock is node-scoped (not EP- or world-scoped) and is
-    released before the runner enters its distributed launch barriers.
+    allocation. The node-scoped lock coordinates Cutlass DSL's documented
+    ``dump_to_object`` / ``load_module`` handoff without changing the external
+    kernel. The lock is released before the runner enters its distributed
+    launch barriers.
     """
     if _local_world_size() <= 1:
         compiled = compile_fn(*args, **kwargs)
@@ -208,10 +267,12 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
         return compiled
 
     lock_path = _compile_lock_path()
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    local_rank = os.environ.get("LOCAL_RANK") or os.environ.get(
-        "SLURM_LOCALID", "?"
+    ordinal = _next_compile_ordinal(label)
+    artifact_path, artifact_prefix = _compile_artifact_identity(
+        lock_path, label, ordinal
     )
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    local_rank = os.environ.get("LOCAL_RANK") or os.environ.get("SLURM_LOCALID", "?")
     node = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
     wait_start = time.monotonic()
     print(
@@ -230,14 +291,34 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
         )
         rss_after_compile = None
         materialized = False
+        source = "cache"
         try:
-            compiled = compile_fn(*args, **kwargs)
-            rss_after_compile = _current_rss_mib()
-            materialized = _materialize_and_release_cute_ir(compiled)
+            if os.path.exists(artifact_path):
+                compiled = _load_cute_object(artifact_path, artifact_prefix)
+                materialized = True
+            else:
+                source = "compile"
+                source_compiled = compile_fn(*args, **kwargs)
+                rss_after_compile = _current_rss_mib()
+                if _publish_cute_object(
+                    source_compiled, artifact_path, artifact_prefix
+                ):
+                    # The binary engine keeps only the exported host shim and
+                    # cubin. Drop the heavyweight MLIR/LLVM JIT engine before
+                    # the next local rank takes the node compile lock.
+                    source_compiled = None
+                    gc.collect()
+                    _trim_process_heap()
+                    compiled = _load_cute_object(artifact_path, artifact_prefix)
+                    materialized = True
+                else:
+                    compiled = source_compiled
+                    materialized = _materialize_and_release_cute_ir(compiled)
+                    source = "compile-no-aot"
             return compiled
         finally:
-            # Drop compiler IR cycles before allowing the next local rank to
-            # enter its peak, while retaining the materialized launcher.
+            # Drop compiler cycles before allowing the next local rank to enter
+            # its peak, while retaining only the loaded binary launcher.
             gc.collect()
             heap_trimmed = _trim_process_heap()
             rss_after_cleanup = _current_rss_mib()
@@ -251,8 +332,9 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
             print(
                 f"FK_MCORE_COMPILE label={label} event=released "
                 f"node={node} local_rank={local_rank} "
-                f"compile_seconds={elapsed:.3f} materialized={materialized} "
-                f"heap_trimmed={heap_trimmed}{rss_fields}",
+                f"ordinal={ordinal} source={source} compile_seconds={elapsed:.3f} "
+                f"materialized={materialized} heap_trimmed={heap_trimmed} "
+                f"artifact={artifact_path}{rss_fields}",
                 flush=True,
             )
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

@@ -125,6 +125,46 @@ def test_fk_cute_compile_materializes_launcher_before_releasing_ir(monkeypatch):
     assert events == [("to", None, True), "trim"]
 
 
+def test_fk_cute_compile_exports_once_and_loads_node_artifact(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    monkeypatch.setenv("SLURM_JOB_ID", "645739")
+    monkeypatch.setenv("SLURMD_NODENAME", "nvl72d117-T01")
+    monkeypatch.setenv("FK_MCORE_COMPILE_LOCK_DIR", str(tmp_path))
+    events = []
+    loaded = object()
+
+    class SourceCompiled:
+        def dump_to_object(self, prefix):
+            events.append(("dump", prefix))
+            return b"fake-cute-object"
+
+    def load_cute_object(path, prefix):
+        events.append(("load", path, prefix))
+        return loaded
+
+    monkeypatch.setattr(fk_runtime, "_load_cute_object", load_cute_object)
+    monkeypatch.setattr(fk_runtime, "_trim_process_heap", lambda: True)
+    fk_runtime._COMPILE_ORDINALS.clear()
+
+    first = fk_runtime._compile_with_node_lock("forward", lambda: SourceCompiled())
+    fk_runtime._COMPILE_ORDINALS.clear()
+    second = fk_runtime._compile_with_node_lock(
+        "forward",
+        lambda: pytest.fail("a cached node artifact must not be recompiled"),
+    )
+
+    artifact = tmp_path / "645739" / "nvl72d117-T01.forward.0.o"
+    prefix = "fk_mcore_forward_0"
+    assert first is loaded
+    assert second is loaded
+    assert artifact.read_bytes() == b"fake-cute-object"
+    assert events == [
+        ("dump", prefix),
+        ("load", str(artifact), prefix),
+        ("load", str(artifact), prefix),
+    ]
+
+
 def test_fk_vendor_compile_wrapper_restores_cute_compile(monkeypatch):
     cutlass = types.ModuleType("cutlass")
     cutlass.__path__ = []
