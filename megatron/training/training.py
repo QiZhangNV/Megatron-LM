@@ -119,7 +119,10 @@ from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metrics_tracker,
+    warmup_moe_metrics_pipeline_communicator,
+)
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -4212,6 +4215,14 @@ def train(
         model_module.train()
 
     model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+
+    # Page-stash workloads can consume nearly all free device memory during the
+    # first step.  MoE logging otherwise initializes its PP NCCL communicator at
+    # the end of that step, where even the communicator's small internal buffer
+    # allocation can OOM.  Warm up the same group before activation stashing
+    # reaches its peak.
+    if args.num_experts is not None and getattr(args, "moe_paged_stash", False):
+        warmup_moe_metrics_pipeline_communicator(model_pg_collection)
 
     # Tracking loss.
     total_loss_dict = {}

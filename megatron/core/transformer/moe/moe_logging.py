@@ -66,6 +66,38 @@ def destroy_moe_metrics_tracker() -> None:
     _MOE_METRICS_TRACKER = None
 
 
+def warmup_moe_metrics_pipeline_communicator(
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> None:
+    """Eagerly initialize the pipeline communicator used by MoE metric reporting.
+
+    NCCL communicators are initialized lazily on their first collective.  MoE
+    metrics normally perform their first pipeline all-reduce after the first
+    training step, when activation-stashing workloads can already be at their
+    peak device-memory footprint.  Initialize that exact communicator before
+    the first step so its internal buffers do not need to be allocated at the
+    memory peak.
+
+    Args:
+        pg_collection: Optional process-group collection associated with the
+            model.  When omitted, use the global pipeline-parallel group.
+    """
+    if not torch.distributed.is_initialized():
+        return
+
+    pp_group = (
+        pg_collection.pp
+        if pg_collection is not None
+        else parallel_state.get_pipeline_model_parallel_group(check_initialized=False)
+    )
+    if pp_group is None or torch.distributed.get_world_size(group=pp_group) <= 1:
+        return
+
+    warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(warmup_tensor, group=pp_group)
+    torch.cuda.synchronize()
+
+
 # ---------------------------------------------------------------------------
 # MoE Overload Factor Tracker (same pattern as MoEMetricsTracker)
 # ---------------------------------------------------------------------------
