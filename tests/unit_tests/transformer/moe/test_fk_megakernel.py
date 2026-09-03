@@ -78,6 +78,56 @@ def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
     assert calls == ["mxfp8_e4m3"]
 
 
+def test_fk_cute_compile_uses_node_scoped_lock(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    monkeypatch.setenv("SLURM_JOB_ID", "645738")
+    monkeypatch.setenv("SLURMD_NODENAME", "nvl72d117-T01")
+    monkeypatch.setenv("FK_MCORE_COMPILE_LOCK_DIR", str(tmp_path))
+    calls = []
+
+    def compile_fn(value, *, scale):
+        calls.append((value, scale))
+        return value * scale
+
+    assert fk_runtime._compile_with_node_lock(
+        "forward", compile_fn, 7, scale=6
+    ) == 42
+    assert calls == [(7, 6)]
+    assert list(tmp_path.glob("645738/*.lock")) == [
+        tmp_path / "645738" / "nvl72d117-T01.lock"
+    ]
+
+
+def test_fk_vendor_compile_wrapper_restores_cute_compile(monkeypatch):
+    cutlass = types.ModuleType("cutlass")
+    cutlass.__path__ = []
+    cute = types.ModuleType("cutlass.cute")
+
+    def original_compile(value):
+        return ("compiled", value)
+
+    cute.compile = original_compile
+    cutlass.cute = cute
+    monkeypatch.setitem(sys.modules, "cutlass", cutlass)
+    monkeypatch.setitem(sys.modules, "cutlass.cute", cute)
+    calls = []
+
+    def compile_with_lock(label, compile_fn, *args, **kwargs):
+        calls.append((label, compile_fn, args, kwargs))
+        return compile_fn(*args, **kwargs)
+
+    monkeypatch.setattr(fk_runtime, "_compile_with_node_lock", compile_with_lock)
+
+    result = fk_runtime._run_with_node_serialized_cute_compiles(
+        "backward", lambda: cute.compile(11)
+    )
+
+    assert result == ("compiled", 11)
+    assert calls == [("backward", original_compile, (11,), {})]
+    assert cute.compile is original_compile
+
+
+
 def test_fk_resets_cudnn_dsa_children_and_lazy_symbol_cache(monkeypatch):
     root = types.ModuleType(fk_runtime._CUDNN_DSA_ROOT)
     child = types.ModuleType(f"{fk_runtime._CUDNN_DSA_ROOT}.utils.compiler")

@@ -9,10 +9,13 @@ shape, scopes NVSHMEM to that EP group, and supplies real MCore tensors.
 from __future__ import annotations
 
 import atexit
+import fcntl
 import gc
 import math
 import os
+import socket
 import sys
+import time
 from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
@@ -107,6 +110,113 @@ _NVSHMEM_STATE: tuple[tuple[int, ...], int] | None = None
 _RUNTIME_CACHE: dict[tuple[Any, ...], "FkRuntime"] = {}
 
 _CUDNN_DSA_ROOT = "cudnn.deepseek_sparse_attention"
+
+
+def _local_world_size() -> int:
+    """Return the number of training processes sharing this node."""
+    for name in ("LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        # Slurm may encode repeated layouts as "4(x64)". The leading integer
+        # is the per-node concurrency relevant to the compile peak.
+        leading_digits = value.split("(", 1)[0]
+        try:
+            return int(leading_digits)
+        except ValueError:
+            continue
+    return 1
+
+
+def _compile_lock_path() -> str:
+    """Build a node-scoped lock path shared by ranks in the same training job."""
+    root = os.environ.get("FK_MCORE_COMPILE_LOCK_DIR")
+    if root is None:
+        project_root = os.environ.get("PROJECT_ROOT")
+        root = (
+            os.path.join(project_root, "runtime", "fk_cute_compile_locks")
+            if project_root
+            else "/tmp/mcore_fk_cute_compile_locks"
+        )
+    job = (
+        os.environ.get("SLURM_JOB_ID")
+        or os.environ.get("TORCHELASTIC_RUN_ID")
+        or f"uid-{os.getuid()}-parent-{os.getppid()}"
+    )
+    node = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
+
+    def safe(component: str) -> str:
+        return "".join(
+            character if character.isalnum() or character in "-_." else "_"
+            for character in component
+        )
+
+    return os.path.join(root, safe(job), f"{safe(node)}.lock")
+
+
+def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
+    """Run one memory-intensive CuTe compile at a time on each physical node.
+
+    A full FK compile can peak near 255 GiB of host RSS. Four simultaneous
+    GPU ranks therefore exceed a GB300 node's roughly 900 GiB Slurm memory
+    allocation. The lock is node-scoped (not EP- or world-scoped) and is
+    released before the runner enters its distributed launch barriers.
+    """
+    if _local_world_size() <= 1:
+        return compile_fn(*args, **kwargs)
+
+    lock_path = _compile_lock_path()
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    local_rank = os.environ.get("LOCAL_RANK") or os.environ.get(
+        "SLURM_LOCALID", "?"
+    )
+    node = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
+    wait_start = time.monotonic()
+    print(
+        f"FK_MCORE_COMPILE label={label} event=waiting "
+        f"node={node} local_rank={local_rank}",
+        flush=True,
+    )
+    with open(lock_path, "a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        compile_start = time.monotonic()
+        print(
+            f"FK_MCORE_COMPILE label={label} event=acquired "
+            f"node={node} local_rank={local_rank} "
+            f"wait_seconds={compile_start - wait_start:.3f}",
+            flush=True,
+        )
+        try:
+            return compile_fn(*args, **kwargs)
+        finally:
+            # Drop compiler IR cycles before allowing the next local rank to
+            # enter its peak, while retaining the returned compiled launcher.
+            gc.collect()
+            elapsed = time.monotonic() - compile_start
+            print(
+                f"FK_MCORE_COMPILE label={label} event=released "
+                f"node={node} local_rank={local_rank} "
+                f"compile_seconds={elapsed:.3f}",
+                flush=True,
+            )
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _run_with_node_serialized_cute_compiles(label: str, callback):
+    """Serialize cute.compile calls made inside an unmodified FK runner."""
+    import cutlass.cute as cute
+
+    original_compile = cute.compile
+
+    def serialized_compile(*args, **kwargs):
+        return _compile_with_node_lock(label, original_compile, *args, **kwargs)
+
+    cute.compile = serialized_compile
+    try:
+        return callback()
+    finally:
+        cute.compile = original_compile
+
 
 
 def _mxfp8_scale_dtype() -> torch.dtype:
@@ -695,7 +805,7 @@ class FkRuntime:
             output_size=self.ep_size * t * k,
         ).reshape(self.ep_size, t, k)
         self._ep_barrier()
-        runner.run_kernel()
+        _run_with_node_serialized_cute_compiles("forward", runner.run_kernel)
         self._ep_barrier()
         runner._global_topk_idx = None
         runner._mcore_activation_quant = quantized
@@ -905,7 +1015,7 @@ class FkRuntime:
             padded_grad_output, runner.my_grad_out, runner.my_grad_out_sf
         )
         runner._dist_barrier = self._ep_barrier
-        runner.run_kernel()
+        _run_with_node_serialized_cute_compiles("backward", runner.run_kernel)
         runner._mcore_grad_quant = quantized
         self.backward_runner = runner
         self._compile_col_requant(context.local_counts)
@@ -957,7 +1067,9 @@ class FkRuntime:
             dst_sf_u8=_to_cute(destination_scale),
             cuda_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
-        compiled = cute.compile(launcher, **kwargs)
+        compiled = _compile_with_node_lock(
+            "col_requant", cute.compile, launcher, **kwargs
+        )
         compiled(**kwargs)
         self._col_requant_compiled = compiled
         self._col_requant_kwargs = kwargs
