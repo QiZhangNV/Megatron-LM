@@ -52,6 +52,7 @@ class FkRuntimeConfig:
     direct_col_quant_context: bool
     fwd_max_active_clusters: int | None
     bwd_max_active_clusters: int | None
+    bwd_workspace_reset_mode: str
     bwd_token_back_mode: str
     external_barrier_mode: str
     bwd_epi_flag_batch: tuple[int, int]
@@ -73,6 +74,7 @@ class FkRuntimeConfig:
             direct_col_quant_context=config.fk_direct_col_quant_context,
             fwd_max_active_clusters=config.fk_fwd_max_active_clusters,
             bwd_max_active_clusters=config.fk_bwd_max_active_clusters,
+            bwd_workspace_reset_mode=config.fk_bwd_workspace_reset_mode,
             bwd_token_back_mode=config.fk_bwd_token_back_mode,
             external_barrier_mode=config.fk_external_barrier_mode,
             bwd_epi_flag_batch=tuple(config.fk_bwd_epi_flag_batch),
@@ -620,6 +622,42 @@ def _count_routes(top_experts: torch.Tensor, num_experts: int) -> torch.Tensor:
     return counts.scatter_add_(
         0, flat_experts, torch.ones_like(flat_experts, dtype=torch.int64)
     )
+
+
+_FK_BWD_COUNTER_REGIONS = (
+    "l1_arrival_count",
+    "expert_send_count",
+    "grid_sync_counter",
+    "fc1_done_counter",
+    "atomic_counter",
+    "load_balance_counter",
+)
+
+
+def _reset_backward_workspace(runner, mode: str) -> None:
+    """Reset reused FK backward state according to MCore's route contract.
+
+    The frozen runner's full reset also clears multi-gigabyte pool payload and
+    output regions because its generic benchmark permits partially populated
+    128-row atoms. MCore pads every expert count to a complete 128-row block
+    and passes those exact counts to column requantization, so stale unused
+    pool payload cannot enter a wgrad operand. The optimized mode retains all
+    protocol counters while avoiding the payload-bandwidth tax.
+    """
+    if mode == "full":
+        runner._reset_local_counters()
+        return
+    if mode != "counters_only":
+        raise ValueError(f"Unsupported FK backward workspace reset mode: {mode}")
+
+    kernel = runner._kernel
+    workspace = runner.local_workspace
+    for name in _FK_BWD_COUNTER_REGIONS:
+        if name not in kernel._local_offsets:
+            continue
+        offset = kernel._local_offsets[name]
+        nbytes = kernel._local_region_by_name[name].nbytes
+        workspace[offset : offset + nbytes].zero_()
 
 
 def _unswizzle_row_scales(
@@ -1377,9 +1415,10 @@ class FkRuntime:
         quantized = self._stage_row_quant(
             padded_grad_output, runner.my_grad_out, runner.my_grad_out_sf
         )
-        # The kernel tail resets accumulating counters, but data/SF padding in
-        # reused workspaces is not guaranteed to be overwritten by every route.
-        runner._reset_local_counters()
+        # The full mode keeps the frozen runner's generic payload reset. The
+        # counters-only mode relies on MCore's stronger aligned-route contract
+        # and still resets every launch-protocol counter below.
+        _reset_backward_workspace(runner, self.config.bwd_workspace_reset_mode)
         runner.grad_activation.zero_()
         runner.dprob.zero_()
         runner.saved_fc1_preact = context.preactivation

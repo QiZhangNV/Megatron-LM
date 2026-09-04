@@ -77,6 +77,32 @@ def test_fk_direct_col_quant_context_reaches_runtime_config():
     assert runtime_config.direct_col_quant_context
 
 
+def test_fk_workspace_reset_mode_reaches_runtime_config():
+    config = _fk_transformer_config(fk_bwd_workspace_reset_mode="counters_only")
+    runtime_config = fk_runtime.FkRuntimeConfig.from_transformer_config(
+        config, num_local_experts=1
+    )
+
+    assert runtime_config.bwd_workspace_reset_mode == "counters_only"
+
+
+def test_fk_counters_only_workspace_reset_preserves_payload():
+    workspace = torch.ones(12, dtype=torch.uint8)
+    kernel = types.SimpleNamespace(
+        _local_offsets={"l1_arrival_count": 1, "l1_token_buffer": 4},
+        _local_region_by_name={
+            "l1_arrival_count": types.SimpleNamespace(nbytes=2),
+            "l1_token_buffer": types.SimpleNamespace(nbytes=6),
+        },
+    )
+    runner = types.SimpleNamespace(_kernel=kernel, local_workspace=workspace)
+
+    fk_runtime._reset_backward_workspace(runner, "counters_only")
+
+    assert torch.equal(workspace[1:3], torch.zeros(2, dtype=torch.uint8))
+    assert torch.equal(workspace[4:10], torch.ones(6, dtype=torch.uint8))
+
+
 def test_fk_mxfp8_scale_dtype_uses_host_utils_contract(monkeypatch):
     calls = []
     common = types.ModuleType("common")
@@ -558,6 +584,7 @@ def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
         ({"fk_external_barrier_mode": "sometimes"}, "fk_external_barrier_mode"),
         ({"fk_fwd_max_active_clusters": 0}, "active cluster"),
         ({"fk_bwd_max_active_clusters": -1}, "active cluster"),
+        ({"fk_bwd_workspace_reset_mode": "payloads_too"}, "workspace_reset_mode"),
     ],
 )
 def test_fk_backend_rejects_unsupported_performance_mode(override, message):

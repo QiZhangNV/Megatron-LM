@@ -854,6 +854,15 @@ class TransformerConfig(ModelParallelConfig):
     fk_bwd_max_active_clusters: Optional[int] = None
     """Optional FK backward persistent-cluster cap; None uses all active clusters."""
 
+    fk_bwd_workspace_reset_mode: str = "full"
+    """FK backward workspace reset policy between reused launches.
+
+    The full mode preserves the external runner's conservative protocol.
+    The counters_only mode is valid when the MCore route adapter pads every
+    expert to complete 128-row blocks, so unused pool payload does not
+    participate in the column-quantized wgrad operands.
+    """
+
     fk_bwd_token_back_mode: str = "standalone_warps"
     """FK backward token-return implementation."""
 
@@ -2339,6 +2348,14 @@ class TransformerConfig(ModelParallelConfig):
                 )
             ):
                 raise ValueError("FK max active cluster limits must be positive")
+            supported_fk_workspace_reset_modes = {"full", "counters_only"}
+            if (
+                self.fk_bwd_workspace_reset_mode not in supported_fk_workspace_reset_modes
+            ):
+                raise ValueError(
+                    "fk_bwd_workspace_reset_mode must be one of "
+                    f"{sorted(supported_fk_workspace_reset_modes)}"
+                )
             supported_fk_token_back_modes = {
                 "standalone_warps",
                 "reuse_dispatch_warps",
