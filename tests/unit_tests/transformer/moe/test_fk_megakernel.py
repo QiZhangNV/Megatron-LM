@@ -217,6 +217,29 @@ def test_fk_cute_compile_can_isolate_rank_local_aot(monkeypatch, tmp_path):
     ]
 
 
+def test_fk_process_memory_breakdown_parses_smaps_rollup(tmp_path):
+    smaps = tmp_path / "smaps_rollup"
+    smaps.write_text(
+        "00400000-7fffffffffff ---p 00000000 00:00 0 [rollup]\n"
+        "Rss:                2048 kB\n"
+        "Pss:                1536 kB\n"
+        "Pss_Anon:           1024 kB\n"
+        "Pss_File:            512 kB\n"
+        "Private_Dirty:       768 kB\n"
+        "Locked:              256 kB\n",
+        encoding="utf-8",
+    )
+
+    assert fk_runtime._process_memory_mib(str(smaps)) == {
+        "rss": 2.0,
+        "pss": 1.5,
+        "pss_anon": 1.0,
+        "pss_file": 0.5,
+        "private_dirty": 0.75,
+        "locked": 0.25,
+    }
+
+
 def test_fk_cute_compile_materializes_launcher_before_releasing_ir(monkeypatch):
     events = []
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")

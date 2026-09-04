@@ -177,6 +177,37 @@ def _current_rss_mib() -> float | None:
         return None
 
 
+def _process_memory_mib(
+    path: str = "/proc/self/smaps_rollup",
+) -> dict[str, float]:
+    """Read a compact process memory breakdown without retaining profiler state."""
+    fields = {
+        "Rss": "rss",
+        "Pss": "pss",
+        "Pss_Anon": "pss_anon",
+        "Pss_File": "pss_file",
+        "Private_Clean": "private_clean",
+        "Private_Dirty": "private_dirty",
+        "Shared_Clean": "shared_clean",
+        "Shared_Dirty": "shared_dirty",
+        "Locked": "locked",
+    }
+    result = {}
+    try:
+        with open(path, "r", encoding="utf-8") as smaps:
+            for line in smaps:
+                key, separator, value = line.partition(":")
+                output_key = fields.get(key)
+                if output_key is None or not separator:
+                    continue
+                parts = value.split()
+                if parts:
+                    result[output_key] = float(parts[0]) / 1024.0
+    except (OSError, ValueError):
+        return {}
+    return result
+
+
 def _trim_process_heap() -> bool:
     """Return free glibc arenas to the node after an MLIR compilation."""
     try:
@@ -857,9 +888,14 @@ class FkRuntime:
         self._forward_calls = 0
         self._backward_calls = 0
         self._debug_enabled = os.environ.get("FK_MCORE_DEBUG", "0") == "1"
+        self._host_memory_debug_enabled = os.environ.get(
+            "FK_MCORE_HOST_MEMORY_DEBUG", "0"
+        ).lower() in {"1", "true", "yes", "on"}
 
+        self._debug_host_memory("runtime_init_enter")
         deps = _prepare_system_dependencies()
         self._precompile_wgrads(deps.cudnn_wgrad)
+        self._debug_host_memory("runtime_init_after_wgrad_precompile")
         _select_fk_packages()
         if self.ep_rank == 0:
             print(
@@ -883,6 +919,21 @@ class FkRuntime:
             "FK_MCORE_DEBUG "
             f"rank={self.ep_rank} forward_call={self._forward_calls} "
             f"backward_call={self._backward_calls} event={event}",
+            flush=True,
+        )
+
+    def _debug_host_memory(self, event: str) -> None:
+        """Emit opt-in bootstrap memory markers for one representative EP rank."""
+        if not self._host_memory_debug_enabled or self.ep_rank != 0:
+            return
+        values = _process_memory_mib()
+        formatted = " ".join(
+            f"{name}_mib={value:.1f}" for name, value in sorted(values.items())
+        )
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            f"FK_MCORE_HOST_MEMORY rank={rank} ep_rank={self.ep_rank} "
+            f"event={event} {formatted}",
             flush=True,
         )
 
@@ -1158,6 +1209,7 @@ class FkRuntime:
             enable_iket=False,
             seed=1234,
         )
+        self._debug_host_memory("forward_before_runner_init")
         runner = MegaMoEMxfp8Tester(
             problem,
             impl,
@@ -1166,6 +1218,7 @@ class FkRuntime:
             kind="mxfp8_e4m3",
             combine_format=combine,
         )
+        self._debug_host_memory("forward_after_runner_init")
         t, h, k = (
             self.padded_num_local_tokens,
             self.config.hidden_size,
@@ -1193,15 +1246,18 @@ class FkRuntime:
             output_size=self.ep_size * t * k,
         ).reshape(self.ep_size, t, k)
         self._ep_barrier()
+        self._debug_host_memory("forward_before_compile")
         _run_with_node_serialized_cute_compiles(
             "forward",
             runner.run_kernel,
             max_active_clusters=self.config.fwd_max_active_clusters,
         )
         self._ep_barrier()
+        self._debug_host_memory("forward_after_compile")
         runner._global_topk_idx = None
         runner._mcore_activation_quant = quantized
         self.forward_runner = runner
+        self._debug_host_memory("forward_runner_ready")
 
     def _update_forward_runtime(
         self,
@@ -1399,6 +1455,7 @@ class FkRuntime:
             enable_iket=False,
             seed=1234,
         )
+        self._debug_host_memory("backward_before_runner_init")
         runner = MegaDswigluMxfp8Tester(
             problem,
             impl,
@@ -1410,6 +1467,7 @@ class FkRuntime:
             route_distribution="balanced",
             combine_format=combine,
         )
+        self._debug_host_memory("backward_after_runner_init")
         t, h, k = (
             self.padded_num_local_tokens,
             self.config.hidden_size,
@@ -1437,14 +1495,17 @@ class FkRuntime:
             padded_grad_output, runner.my_grad_out, runner.my_grad_out_sf
         )
         runner._dist_barrier = self._ep_barrier
+        self._debug_host_memory("backward_before_compile")
         _run_with_node_serialized_cute_compiles(
             "backward",
             runner.run_kernel,
             max_active_clusters=self.config.bwd_max_active_clusters,
         )
         runner._mcore_grad_quant = quantized
+        self._debug_host_memory("backward_after_compile")
         self.backward_runner = runner
         self._compile_col_requant(context.local_counts)
+        self._debug_host_memory("backward_runner_ready")
 
     @staticmethod
     def _workspace_view(runner, name: str, dtype: torch.dtype) -> torch.Tensor:
