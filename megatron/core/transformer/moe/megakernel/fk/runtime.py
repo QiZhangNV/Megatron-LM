@@ -17,6 +17,7 @@ import os
 import socket
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
@@ -258,6 +259,16 @@ def _cute_aot_scope(label: str, ordinal: int) -> str | None:
     return "node"
 
 
+def _isolated_aot_compile_enabled() -> bool:
+    """Whether heavyweight exportable CuTe compiles run in a forked child."""
+    return os.environ.get("FK_MCORE_ISOLATE_AOT_COMPILE", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _publish_cute_object(compiled: Any, path: str, prefix: str) -> bool:
     """Atomically publish a CuTe callable as an official AOT object."""
     dump_to_object = getattr(compiled, "dump_to_object", None)
@@ -276,6 +287,93 @@ def _publish_cute_object(compiled: Any, path: str, prefix: str) -> bool:
         except FileNotFoundError:
             pass
     return True
+
+
+def _compile_and_publish_cute_object_isolated(
+    compile_fn,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    path: str,
+    prefix: str,
+) -> float | None:
+    """Compile and export an AOT object in a disposable forked process.
+
+    CuTe/MLIR may retain hundreds of GiB of host RSS after a full-model
+    backward compile even after its Python objects are collected. The child
+    inherits this rank's exact launch arguments and rank-local state, publishes
+    the same official AOT object used by the in-process path, and then exits.
+    The training process subsequently loads only the binary launcher.
+    """
+    if not hasattr(os, "fork"):
+        raise RuntimeError(
+            "FK_MCORE_ISOLATE_AOT_COMPILE requires os.fork on this platform"
+        )
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    child_pid = os.fork()
+    if child_pid == 0:
+        error_path = f"{path}.error.{os.getpid()}"
+        rss_path = f"{path}.rss.{os.getpid()}"
+        exit_code = 1
+        try:
+            compiled = compile_fn(*args, **kwargs)
+            child_rss = _current_rss_mib()
+            if not _publish_cute_object(compiled, path, prefix):
+                raise RuntimeError("CuTe compiled callable does not support AOT export")
+            if child_rss is not None:
+                with open(rss_path, "w", encoding="utf-8") as rss_file:
+                    rss_file.write(str(child_rss))
+            exit_code = 0
+        except BaseException:  # Child must preserve the original compile failure.
+            try:
+                with open(error_path, "w", encoding="utf-8") as error_file:
+                    error_file.write(traceback.format_exc())
+            except OSError:
+                pass
+        finally:
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            finally:
+                os._exit(exit_code)
+
+    while True:
+        try:
+            _, status = os.waitpid(child_pid, 0)
+            break
+        except InterruptedError:
+            continue
+    error_path = f"{path}.error.{child_pid}"
+    rss_path = f"{path}.rss.{child_pid}"
+    try:
+        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+            details = ""
+            try:
+                with open(error_path, "r", encoding="utf-8") as error_file:
+                    details = error_file.read().strip()
+            except OSError:
+                pass
+            if os.WIFSIGNALED(status):
+                outcome = f"signal {os.WTERMSIG(status)}"
+            else:
+                outcome = f"exit code {os.WEXITSTATUS(status)}"
+            suffix = f"\n{details}" if details else ""
+            raise RuntimeError(
+                f"isolated FK CuTe compile failed with {outcome}{suffix}"
+            )
+
+        try:
+            with open(rss_path, "r", encoding="utf-8") as rss_file:
+                return float(rss_file.read())
+        except (OSError, ValueError):
+            return None
+    finally:
+        for temporary_path in (error_path, rss_path):
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
 
 
 def _load_cute_object(path: str, prefix: str):
@@ -346,27 +444,41 @@ def _compile_with_node_lock(label: str, compile_fn, *args, **kwargs):
                 materialized = True
             else:
                 source = "compile"
-                source_compiled = compile_fn(*args, **kwargs)
-                rss_after_compile = _current_rss_mib()
-                if aot_scope is not None and _publish_cute_object(
-                    source_compiled,
-                    artifact_path,
-                    artifact_prefix,
-                ):
-                    # The binary engine keeps only the exported host shim and
-                    # cubin. Drop the heavyweight MLIR/LLVM JIT engine before
-                    # the next local rank takes the node compile lock.
-                    source_compiled = None
-                    gc.collect()
-                    _trim_process_heap()
+                if aot_scope is not None and _isolated_aot_compile_enabled():
+                    source = "compile-isolated"
+                    rss_after_compile = _compile_and_publish_cute_object_isolated(
+                        compile_fn,
+                        args,
+                        kwargs,
+                        artifact_path,
+                        artifact_prefix,
+                    )
                     compiled = _load_cute_object(artifact_path, artifact_prefix)
                     materialized = True
                 else:
-                    compiled = source_compiled
-                    materialized = _materialize_and_release_cute_ir(compiled)
-                    source = (
-                        "compile-no-aot" if aot_scope is not None else "compile-local"
-                    )
+                    source_compiled = compile_fn(*args, **kwargs)
+                    rss_after_compile = _current_rss_mib()
+                    if aot_scope is not None and _publish_cute_object(
+                        source_compiled,
+                        artifact_path,
+                        artifact_prefix,
+                    ):
+                        # The binary engine keeps only the exported host shim and
+                        # cubin. Drop the heavyweight MLIR/LLVM JIT engine before
+                        # the next local rank takes the node compile lock.
+                        source_compiled = None
+                        gc.collect()
+                        _trim_process_heap()
+                        compiled = _load_cute_object(artifact_path, artifact_prefix)
+                        materialized = True
+                    else:
+                        compiled = source_compiled
+                        materialized = _materialize_and_release_cute_ir(compiled)
+                        source = (
+                            "compile-no-aot"
+                            if aot_scope is not None
+                            else "compile-local"
+                        )
             return compiled
         finally:
             # Drop compiler cycles before allowing the next local rank to enter

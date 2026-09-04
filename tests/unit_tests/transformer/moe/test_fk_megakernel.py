@@ -165,6 +165,58 @@ def test_fk_cute_aot_rank_scope_uses_distinct_artifact_names(tmp_path):
     assert rank_one[0].endswith("node.backward.1.rank-1.o")
 
 
+def test_fk_cute_compile_can_isolate_rank_local_aot(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setenv("SLURM_JOB_ID", "645740")
+    monkeypatch.setenv("SLURMD_NODENAME", "nvl72d117-T01")
+    monkeypatch.setenv("FK_MCORE_COMPILE_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("FK_MCORE_ISOLATE_AOT_COMPILE", "true")
+    events = []
+    loaded = object()
+
+    def compile_fn(value, *, scale):
+        pytest.fail("the parent process must not run an isolated compile")
+
+    def isolated_compile(function, args, kwargs, path, prefix):
+        events.append(("compile-isolated", function, args, kwargs, path, prefix))
+        with open(path, "wb") as artifact_file:
+            artifact_file.write(b"fake-cute-object")
+        return 234.5
+
+    def load_cute_object(path, prefix):
+        events.append(("load", path, prefix))
+        return loaded
+
+    monkeypatch.setattr(
+        fk_runtime,
+        "_compile_and_publish_cute_object_isolated",
+        isolated_compile,
+    )
+    monkeypatch.setattr(fk_runtime, "_load_cute_object", load_cute_object)
+    monkeypatch.setattr(fk_runtime, "_trim_process_heap", lambda: True)
+    fk_runtime._COMPILE_ORDINALS.clear()
+    fk_runtime._COMPILE_ORDINALS["backward"] = 1
+
+    result = fk_runtime._compile_with_node_lock("backward", compile_fn, 7, scale=6)
+
+    artifact = tmp_path / "645740" / "nvl72d117-T01.backward.1.rank-2.o"
+    prefix = "fk_mcore_backward_1_rank_2"
+    assert result is loaded
+    assert artifact.read_bytes() == b"fake-cute-object"
+    assert events == [
+        (
+            "compile-isolated",
+            compile_fn,
+            (7,),
+            {"scale": 6},
+            str(artifact),
+            prefix,
+        ),
+        ("load", str(artifact), prefix),
+    ]
+
+
 def test_fk_cute_compile_materializes_launcher_before_releasing_ir(monkeypatch):
     events = []
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
