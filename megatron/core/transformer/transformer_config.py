@@ -870,8 +870,9 @@ class TransformerConfig(ModelParallelConfig):
     """External EP rendezvous around reused FK kernel launches.
 
     ``pre_and_post`` preserves the conservative initial integration behavior,
-    ``pre`` keeps one rendezvous before each launch, and ``none`` relies on the
-    FK kernel-tail back-to-back launch protocol.
+    ``pre`` keeps one host-synchronous rendezvous before each launch,
+    ``nvshmem_pre`` keeps only the stream-ordered NVSHMEM rendezvous before each
+    launch, and ``none`` relies on the FK kernel-tail back-to-back protocol.
     """
 
     fk_bwd_epi_flag_batch: Tuple[int, int] = field(
@@ -2365,7 +2366,12 @@ class TransformerConfig(ModelParallelConfig):
                     "fk_bwd_token_back_mode must be one of "
                     f"{sorted(supported_fk_token_back_modes)}"
                 )
-            supported_fk_external_barrier_modes = {"pre_and_post", "pre", "none"}
+            supported_fk_external_barrier_modes = {
+                "pre_and_post",
+                "pre",
+                "nvshmem_pre",
+                "none",
+            }
             if self.fk_external_barrier_mode not in supported_fk_external_barrier_modes:
                 raise ValueError(
                     "fk_external_barrier_mode must be one of "

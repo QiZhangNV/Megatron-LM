@@ -955,6 +955,11 @@ class FkRuntime:
             flush=True,
         )
 
+    def _ep_stream_barrier(self) -> None:
+        """Enqueue an EP-scoped NVSHMEM rendezvous on the current CUDA stream."""
+        stream = torch.cuda.current_stream()
+        _prepare_system_dependencies().nvshmem.barrier_all(stream)
+
     def _ep_barrier(self) -> None:
         stream = torch.cuda.current_stream()
         if torch.cuda.is_current_stream_capturing():
@@ -964,7 +969,7 @@ class FkRuntime:
             # the Python wait would block for work that only runs on replay.
             # Keep the stream-ordered NVSHMEM rendezvous in the graph so peer
             # communication workspaces remain separated between FK launches.
-            _prepare_system_dependencies().nvshmem.barrier_all(stream)
+            self._ep_stream_barrier()
             return
         torch.cuda.synchronize()
         dist.barrier(group=self.ep_group)
@@ -980,7 +985,9 @@ class FkRuntime:
         workloads to measure one or zero additional adapter-owned barriers.
         """
         barrier_mode = self.config.external_barrier_mode
-        if barrier_mode in ("pre_and_post", "pre"):
+        if barrier_mode == "nvshmem_pre":
+            self._ep_stream_barrier()
+        elif barrier_mode in ("pre_and_post", "pre"):
             self._ep_barrier()
         compiled_kernel(**kwargs)
         if barrier_mode == "pre_and_post":

@@ -413,6 +413,7 @@ def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
     [
         ("pre_and_post", ["barrier", ("kernel", {"value": 7}), "barrier"]),
         ("pre", ["barrier", ("kernel", {"value": 7})]),
+        ("nvshmem_pre", ["stream_barrier", ("kernel", {"value": 7})]),
         ("none", [("kernel", {"value": 7})]),
     ],
 )
@@ -421,6 +422,7 @@ def test_fk_reused_kernel_external_barrier_modes(barrier_mode, expected):
     runtime.config = types.SimpleNamespace(external_barrier_mode=barrier_mode)
     events = []
     runtime._ep_barrier = lambda: events.append("barrier")
+    runtime._ep_stream_barrier = lambda: events.append("stream_barrier")
 
     def compiled_kernel(**kwargs):
         events.append(("kernel", kwargs))
@@ -454,6 +456,32 @@ def test_fk_ep_barrier_uses_only_stream_ordered_nvshmem_during_capture(monkeypat
     )
 
     runtime._ep_barrier()
+
+    assert events == [("nvshmem", stream)]
+
+
+def test_fk_ep_stream_barrier_uses_only_nvshmem(monkeypatch):
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    stream = object()
+    events = []
+    nvshmem = types.SimpleNamespace(
+        barrier_all=lambda actual_stream: events.append(("nvshmem", actual_stream))
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: events.append("cuda_synchronize")
+    )
+    monkeypatch.setattr(
+        fk_runtime.dist, "barrier", lambda **kwargs: events.append(("dist", kwargs))
+    )
+    monkeypatch.setattr(
+        fk_runtime,
+        "_prepare_system_dependencies",
+        lambda: types.SimpleNamespace(nvshmem=nvshmem),
+    )
+
+    runtime._ep_stream_barrier()
 
     assert events == [("nvshmem", stream)]
 
@@ -645,7 +673,9 @@ def test_fk_backend_accepts_supported_token_back_modes(token_back_mode):
     assert config.fk_bwd_token_back_mode == token_back_mode
 
 
-@pytest.mark.parametrize("barrier_mode", ["pre_and_post", "pre", "none"])
+@pytest.mark.parametrize(
+    "barrier_mode", ["pre_and_post", "pre", "nvshmem_pre", "none"]
+)
 def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
     config = _fk_transformer_config(fk_external_barrier_mode=barrier_mode)
 
