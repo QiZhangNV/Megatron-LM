@@ -19,7 +19,9 @@ from megatron.core.transformer.moe.megakernel.fk.route_padding import (
     FK_ROUTE_ALIGNMENT,
     build_route_padding_plan,
     build_route_padding_tensors,
+    build_route_padding_tensors_fused,
     calculate_local_route_capacity,
+    count_compact_routes_fused,
 )
 from megatron.core.transformer.moe.paged_stash import PagedStashManager
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -84,6 +86,15 @@ def test_fk_route_count_reduce_backend_reaches_runtime_config():
     )
 
     assert runtime_config.route_count_reduce_backend == "nvshmem"
+
+
+def test_fk_route_padding_impl_reaches_runtime_config():
+    config = _fk_transformer_config(fk_route_padding_impl="triton")
+    runtime_config = fk_runtime.FkRuntimeConfig.from_transformer_config(
+        config, num_local_experts=1
+    )
+
+    assert runtime_config.route_padding_impl == "triton"
 
 
 def test_fk_external_host_sync_interval_reaches_runtime_config():
@@ -828,6 +839,7 @@ def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
         ({"fk_fwd_max_active_clusters": 0}, "active cluster"),
         ({"fk_bwd_max_active_clusters": -1}, "active cluster"),
         ({"fk_bwd_workspace_reset_mode": "payloads_too"}, "workspace_reset_mode"),
+        ({"fk_route_padding_impl": "cuda"}, "route_padding_impl"),
         ({"fk_route_count_reduce_backend": "mpi"}, "route_count_reduce_backend"),
         ({"fk_external_host_sync_interval": 0}, "host_sync_interval"),
     ],
@@ -983,6 +995,58 @@ def test_fk_tensor_route_padding_matches_host_targets_and_preserves_deficits():
     assert torch.all(sorted_rows.diff(dim=-1) != 0)
     dummy_counts = torch.bincount(dummy_experts.reshape(-1), minlength=num_experts)
     assert torch.equal(torch.tensor(counts) + dummy_counts, padded_counts)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fk_fused_route_count_and_padding_match_torch_plan():
+    ep_size = 16
+    num_experts = 96
+    num_local_tokens = 4096
+    topk = 6
+    num_local_experts = num_experts // ep_size
+    counts = torch.full(
+        (num_experts,),
+        ep_size * num_local_tokens * topk // num_experts,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    for ep_rank in range(ep_size):
+        begin = ep_rank * num_local_experts
+        counts[begin] += 63
+        counts[begin + 1] -= 63
+        counts[begin + 2] += 17
+        counts[begin + 3] -= 17
+    capacity = calculate_local_route_capacity(
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        num_local_experts=num_local_experts,
+        capacity_factor=1.0625,
+    )
+
+    expected_counts, expected_dummy_experts = build_route_padding_tensors(
+        counts,
+        ep_size=ep_size,
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        local_capacity=capacity,
+    )
+    actual_counts, actual_dummy_experts = build_route_padding_tensors_fused(
+        counts.to(torch.int32),
+        ep_size=ep_size,
+        num_local_tokens=num_local_tokens,
+        topk=topk,
+        local_capacity=capacity,
+    )
+
+    assert torch.equal(actual_counts, expected_counts)
+    assert torch.equal(actual_dummy_experts, expected_dummy_experts)
+
+    top_experts = torch.repeat_interleave(
+        torch.arange(num_experts, device="cuda", dtype=torch.int64), counts
+    ).reshape(ep_size * num_local_tokens, topk)
+    actual_route_counts = count_compact_routes_fused(top_experts, num_experts)
+    assert actual_route_counts.dtype == torch.int32
+    assert torch.equal(actual_route_counts.to(torch.int64), counts)
 
 
 def test_fk_route_padding_reports_destination_rank_overflow():

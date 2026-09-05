@@ -835,6 +835,14 @@ class TransformerConfig(ModelParallelConfig):
     still requires enough headroom to cover per-expert padding.
     """
 
+    fk_route_padding_impl: str = "torch"
+    """Implementation used by the MCore-side FK route-padding adapter.
+
+    ``torch`` keeps the conservative eager tensor plan. ``triton`` uses a
+    fixed-shape fused plan to reduce adapter launch overhead without changing
+    the external FK kernel or its route interface.
+    """
+
     fk_route_count_reduce_backend: str = "nccl"
     """Collective backend for FK's global route-count padding plan.
 
@@ -2360,6 +2368,12 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("FK currently requires SwiGLU")
             if self.fk_expert_rank_capacity_factor < 1.0:
                 raise ValueError("fk_expert_rank_capacity_factor must be at least 1.0")
+            supported_fk_route_padding_impls = {"torch", "triton"}
+            if self.fk_route_padding_impl not in supported_fk_route_padding_impls:
+                raise ValueError(
+                    "fk_route_padding_impl must be one of "
+                    f"{sorted(supported_fk_route_padding_impls)}"
+                )
             supported_fk_route_count_reduce_backends = {"nccl", "nvshmem"}
             if (
                 self.fk_route_count_reduce_backend

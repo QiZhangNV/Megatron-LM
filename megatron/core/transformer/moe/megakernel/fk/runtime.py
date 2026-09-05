@@ -29,7 +29,9 @@ from torch.distributed import ProcessGroup
 
 from megatron.core.transformer.moe.megakernel.fk.route_padding import (
     build_route_padding_tensors,
+    build_route_padding_tensors_fused,
     calculate_local_route_capacity,
+    count_compact_routes_fused,
 )
 from megatron.core.transformer.moe.megakernel.fk.weights import FkWeightView
 
@@ -47,6 +49,7 @@ class FkRuntimeConfig:
     num_local_experts: int
     topk: int
     capacity_factor: float
+    route_padding_impl: str
     route_count_reduce_backend: str
     swiglu_limit: float | None
     fwd_group_hint: int
@@ -71,6 +74,7 @@ class FkRuntimeConfig:
             num_local_experts=num_local_experts,
             topk=config.moe_router_topk,
             capacity_factor=config.fk_expert_rank_capacity_factor,
+            route_padding_impl=config.fk_route_padding_impl,
             route_count_reduce_backend=config.fk_route_count_reduce_backend,
             swiglu_limit=config.activation_func_clamp_value,
             fwd_group_hint=config.fk_fwd_group_hint,
@@ -882,6 +886,12 @@ class FkRuntime:
             capacity_factor=config.capacity_factor,
         )
         self.padded_num_local_tokens = self.local_capacity // config.topk
+        if (
+            config.route_padding_impl == "triton"
+            and self.ep_size * self.num_local_tokens * self.config.topk
+            > torch.iinfo(torch.int32).max
+        ):
+            raise RuntimeError("FK fused route counts exceed int32 capacity")
         self.forward_runner = None
         self.backward_runner = None
         self._col_requant_compiled = None
@@ -907,12 +917,8 @@ class FkRuntime:
         if config.route_count_reduce_backend == "nvshmem":
             from moe_mxfp8_glu.mega_runner import _sym_zeros
 
-            self._route_counts_src = _sym_zeros(
-                (config.num_experts,), torch.int64
-            )
-            self._route_counts_dst = _sym_zeros(
-                (config.num_experts,), torch.int64
-            )
+            self._route_counts_src = _sym_zeros((config.num_experts,), torch.int64)
+            self._route_counts_dst = _sym_zeros((config.num_experts,), torch.int64)
         if self.ep_rank == 0:
             print(
                 "FK_MCORE_RUNTIME "
@@ -920,6 +926,7 @@ class FkRuntime:
                 f"padded_tokens={self.padded_num_local_tokens} "
                 f"local_route_capacity={self.local_capacity} "
                 f"capacity_factor={config.capacity_factor} "
+                f"route_padding={config.route_padding_impl} "
                 f"route_count_reduce={config.route_count_reduce_backend} "
                 f"token_back={config.bwd_token_back_mode} "
                 f"external_barrier={config.external_barrier_mode} "
@@ -1098,16 +1105,24 @@ class FkRuntime:
             )
         if top_experts.dtype != torch.int64:
             raise TypeError("FK compact expert indices must be int64")
-        invalid = (top_experts < 0) | (top_experts >= self.config.num_experts)
-        torch._assert_async(
-            torch.logical_not(invalid.any()),
-            "FK MVP requires exactly topk valid expert indices per token",
-        )
         self._debug("pad_routes_before_counts_all_reduce")
-        counts = _count_routes(top_experts, self.config.num_experts)
+        if self.config.route_padding_impl == "triton":
+            counts = count_compact_routes_fused(top_experts, self.config.num_experts)
+        else:
+            invalid = (top_experts < 0) | (top_experts >= self.config.num_experts)
+            torch._assert_async(
+                torch.logical_not(invalid.any()),
+                "FK MVP requires exactly topk valid expert indices per token",
+            )
+            counts = _count_routes(top_experts, self.config.num_experts)
         counts = self._reduce_route_counts(counts)
         self._debug("pad_routes_after_counts_all_reduce")
-        padded_counts, dummy_experts_by_source_rank = build_route_padding_tensors(
+        padding_builder = (
+            build_route_padding_tensors_fused
+            if self.config.route_padding_impl == "triton"
+            else build_route_padding_tensors
+        )
+        padded_counts, dummy_experts_by_source_rank = padding_builder(
             counts,
             ep_size=self.ep_size,
             num_local_tokens=self.num_local_tokens,
