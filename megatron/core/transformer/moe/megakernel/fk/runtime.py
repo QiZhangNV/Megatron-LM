@@ -982,7 +982,7 @@ class FkRuntime:
         barrier_mode = self.config.external_barrier_mode
         if barrier_mode in ("pre_and_post", "pre"):
             self._ep_barrier()
-        elif barrier_mode in ("stream_pre_host_post", "stream_pre_and_post"):
+        elif barrier_mode in ("stream_pre_host_post", "stream_pre_host_stream_post"):
             # Match FK's repeated-launch performance harness: order a device-
             # side NVSHMEM rendezvous before the launch, then wait for local
             # completion below. This preserves the symmetric-workspace reuse
@@ -994,12 +994,8 @@ class FkRuntime:
             self._ep_barrier()
         elif barrier_mode == "stream_pre_host_post":
             torch.cuda.synchronize()
-        elif barrier_mode == "stream_pre_and_post":
-            # Keep the host free to enqueue later work, but do not let
-            # downstream consumers run until every peer has completed the
-            # remote writes associated with this launch.
-            stream = torch.cuda.current_stream()
-            _prepare_system_dependencies().nvshmem.barrier_all(stream)
+        elif barrier_mode == "stream_pre_host_stream_post":
+            torch.cuda.current_stream().synchronize()
 
     def _precompile_wgrads(self, cudnn_wgrad) -> None:
         counts = torch.full(

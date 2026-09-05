@@ -431,23 +431,19 @@ def test_fk_reused_kernel_external_barrier_modes(barrier_mode, expected):
 
 
 @pytest.mark.parametrize(
-    ("barrier_mode", "expected"),
+    ("barrier_mode", "post_event"),
     [
-        (
-            "stream_pre_host_post",
-            [("nvshmem", "stream"), ("kernel", {"value": 7}), "cuda_synchronize"],
-        ),
-        (
-            "stream_pre_and_post",
-            [("nvshmem", "stream"), ("kernel", {"value": 7}), ("nvshmem", "stream")],
-        ),
+        ("stream_pre_host_post", "cuda_synchronize"),
+        ("stream_pre_host_stream_post", "stream_synchronize"),
     ],
 )
-def test_fk_stream_barrier_protocols(monkeypatch, barrier_mode, expected):
+def test_fk_stream_barrier_protocols(monkeypatch, barrier_mode, post_event):
     runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
     runtime.config = types.SimpleNamespace(external_barrier_mode=barrier_mode)
-    stream = "stream"
     events = []
+    stream = types.SimpleNamespace(
+        synchronize=lambda: events.append("stream_synchronize")
+    )
     nvshmem = types.SimpleNamespace(
         barrier_all=lambda actual_stream: events.append(("nvshmem", actual_stream))
     )
@@ -466,7 +462,11 @@ def test_fk_stream_barrier_protocols(monkeypatch, barrier_mode, expected):
         lambda **kwargs: events.append(("kernel", kwargs)), {"value": 7}
     )
 
-    assert events == expected
+    assert events == [
+        ("nvshmem", stream),
+        ("kernel", {"value": 7}),
+        post_event,
+    ]
 
 
 def test_fk_ep_barrier_uses_only_stream_ordered_nvshmem_during_capture(monkeypatch):
@@ -690,7 +690,7 @@ def test_fk_backend_accepts_supported_token_back_modes(token_back_mode):
         "pre_and_post",
         "pre",
         "stream_pre_host_post",
-        "stream_pre_and_post",
+        "stream_pre_host_stream_post",
         "none",
     ],
 )
@@ -715,21 +715,16 @@ def test_fk_backend_rejects_unsupported_performance_mode(override, message):
         _fk_transformer_config(**override)
 
 
-def test_fk_backend_rejects_stream_host_sync_during_cuda_graph_capture():
+@pytest.mark.parametrize(
+    "barrier_mode",
+    ["stream_pre_host_post", "stream_pre_host_stream_post"],
+)
+def test_fk_backend_rejects_stream_host_sync_during_cuda_graph_capture(barrier_mode):
     with pytest.raises(ValueError, match="eager-only"):
         _fk_transformer_config(
-            fk_external_barrier_mode="stream_pre_host_post",
+            fk_external_barrier_mode=barrier_mode,
             cuda_graph_impl="full_iteration",
         )
-
-
-def test_fk_stream_pre_and_post_accepts_full_iteration_cuda_graph():
-    config = _fk_transformer_config(
-        fk_external_barrier_mode="stream_pre_and_post",
-        cuda_graph_impl="full_iteration",
-    )
-
-    assert config.fk_external_barrier_mode == "stream_pre_and_post"
 
 
 def test_fk_shared_expert_keeps_native_mxfp8_config():
