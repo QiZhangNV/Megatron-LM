@@ -887,6 +887,15 @@ class TransformerConfig(ModelParallelConfig):
     stream barriers are not safe for repeated eager iterations.
     """
 
+    fk_external_host_sync_interval: int = 1
+    """Number of FK launches between eager current-stream host waits.
+
+    This applies only to ``stream_pre_host_stream_post``.  The default of one
+    preserves the validated launch-by-launch pacing.  Values greater than one
+    keep the pre-launch NVSHMEM rendezvous on every launch while bounding how
+    far the host may enqueue persistent FK work before waiting.
+    """
+
     fk_bwd_epi_flag_batch: Tuple[int, int] = field(
         default=(1, 1), metadata={"argparse_meta": {"type": int, "nargs": 2}}
     )
@@ -2399,6 +2408,8 @@ class TransformerConfig(ModelParallelConfig):
                     "fk_external_barrier_mode must be one of "
                     f"{sorted(supported_fk_external_barrier_modes)}"
                 )
+            if self.fk_external_host_sync_interval <= 0:
+                raise ValueError("fk_external_host_sync_interval must be positive")
             if (
                 self.fk_external_barrier_mode
                 in {

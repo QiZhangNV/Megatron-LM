@@ -86,6 +86,15 @@ def test_fk_route_count_reduce_backend_reaches_runtime_config():
     assert runtime_config.route_count_reduce_backend == "nvshmem"
 
 
+def test_fk_external_host_sync_interval_reaches_runtime_config():
+    config = _fk_transformer_config(fk_external_host_sync_interval=2)
+    runtime_config = fk_runtime.FkRuntimeConfig.from_transformer_config(
+        config, num_local_experts=1
+    )
+
+    assert runtime_config.external_host_sync_interval == 2
+
+
 def test_fk_workspace_reset_mode_reaches_runtime_config():
     config = _fk_transformer_config(fk_bwd_workspace_reset_mode="counters_only")
     runtime_config = fk_runtime.FkRuntimeConfig.from_transformer_config(
@@ -448,7 +457,9 @@ def test_fk_reused_kernel_external_barrier_modes(barrier_mode, expected):
 )
 def test_fk_stream_barrier_protocols(monkeypatch, barrier_mode, post_event):
     runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
-    runtime.config = types.SimpleNamespace(external_barrier_mode=barrier_mode)
+    runtime.config = types.SimpleNamespace(
+        external_barrier_mode=barrier_mode, external_host_sync_interval=1
+    )
     events = []
     stream = types.SimpleNamespace(
         synchronize=lambda: events.append("stream_synchronize")
@@ -475,6 +486,41 @@ def test_fk_stream_barrier_protocols(monkeypatch, barrier_mode, post_event):
         ("nvshmem", stream),
         ("kernel", {"value": 7}),
         post_event,
+    ]
+
+
+def test_fk_current_stream_host_sync_can_be_bounded(monkeypatch):
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    runtime.config = types.SimpleNamespace(
+        external_barrier_mode="stream_pre_host_stream_post",
+        external_host_sync_interval=2,
+    )
+    events = []
+    stream = types.SimpleNamespace(
+        synchronize=lambda: events.append("stream_synchronize")
+    )
+    nvshmem = types.SimpleNamespace(
+        barrier_all=lambda actual_stream: events.append(("nvshmem", actual_stream))
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(
+        fk_runtime,
+        "_prepare_system_dependencies",
+        lambda: types.SimpleNamespace(nvshmem=nvshmem),
+    )
+
+    for value in (1, 2):
+        runtime._launch_distributed_kernel(
+            lambda **kwargs: events.append(("kernel", kwargs)), {"value": value}
+        )
+
+    assert events == [
+        ("nvshmem", stream),
+        ("kernel", {"value": 1}),
+        ("nvshmem", stream),
+        ("kernel", {"value": 2}),
+        "stream_synchronize",
     ]
 
 
@@ -783,6 +829,7 @@ def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
         ({"fk_bwd_max_active_clusters": -1}, "active cluster"),
         ({"fk_bwd_workspace_reset_mode": "payloads_too"}, "workspace_reset_mode"),
         ({"fk_route_count_reduce_backend": "mpi"}, "route_count_reduce_backend"),
+        ({"fk_external_host_sync_interval": 0}, "host_sync_interval"),
     ],
 )
 def test_fk_backend_rejects_unsupported_performance_mode(override, message):

@@ -57,6 +57,7 @@ class FkRuntimeConfig:
     bwd_workspace_reset_mode: str
     bwd_token_back_mode: str
     external_barrier_mode: str
+    external_host_sync_interval: int
     bwd_epi_flag_batch: tuple[int, int]
 
     @classmethod
@@ -80,6 +81,7 @@ class FkRuntimeConfig:
             bwd_workspace_reset_mode=config.fk_bwd_workspace_reset_mode,
             bwd_token_back_mode=config.fk_bwd_token_back_mode,
             external_barrier_mode=config.fk_external_barrier_mode,
+            external_host_sync_interval=config.fk_external_host_sync_interval,
             bwd_epi_flag_batch=tuple(config.fk_bwd_epi_flag_batch),
         )
 
@@ -891,6 +893,7 @@ class FkRuntime:
         self._route_counts_dst = None
         self._forward_calls = 0
         self._backward_calls = 0
+        self._launches_since_host_sync = 0
         self._debug_enabled = os.environ.get("FK_MCORE_DEBUG", "0") == "1"
         self._host_memory_debug_enabled = os.environ.get(
             "FK_MCORE_HOST_MEMORY_DEBUG", "0"
@@ -919,7 +922,8 @@ class FkRuntime:
                 f"capacity_factor={config.capacity_factor} "
                 f"route_count_reduce={config.route_count_reduce_backend} "
                 f"token_back={config.bwd_token_back_mode} "
-                f"external_barrier={config.external_barrier_mode}",
+                f"external_barrier={config.external_barrier_mode} "
+                f"host_sync_interval={config.external_host_sync_interval}",
                 flush=True,
             )
 
@@ -1009,7 +1013,15 @@ class FkRuntime:
         elif barrier_mode == "stream_pre_host_post":
             torch.cuda.synchronize()
         elif barrier_mode == "stream_pre_host_stream_post":
-            torch.cuda.current_stream().synchronize()
+            self._launches_since_host_sync = (
+                getattr(self, "_launches_since_host_sync", 0) + 1
+            )
+            if (
+                self._launches_since_host_sync
+                >= self.config.external_host_sync_interval
+            ):
+                torch.cuda.current_stream().synchronize()
+                self._launches_since_host_sync = 0
 
     def _precompile_wgrads(self, cudnn_wgrad) -> None:
         counts = torch.full(
