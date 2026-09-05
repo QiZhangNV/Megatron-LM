@@ -955,11 +955,6 @@ class FkRuntime:
             flush=True,
         )
 
-    def _ep_stream_barrier(self) -> None:
-        """Enqueue an EP-scoped NVSHMEM rendezvous on the current CUDA stream."""
-        stream = torch.cuda.current_stream()
-        _prepare_system_dependencies().nvshmem.barrier_all(stream)
-
     def _ep_barrier(self) -> None:
         stream = torch.cuda.current_stream()
         if torch.cuda.is_current_stream_capturing():
@@ -969,12 +964,22 @@ class FkRuntime:
             # the Python wait would block for work that only runs on replay.
             # Keep the stream-ordered NVSHMEM rendezvous in the graph so peer
             # communication workspaces remain separated between FK launches.
-            self._ep_stream_barrier()
+            _prepare_system_dependencies().nvshmem.barrier_all(stream)
             return
         torch.cuda.synchronize()
         dist.barrier(group=self.ep_group)
         _prepare_system_dependencies().nvshmem.barrier_all(stream)
         torch.cuda.synchronize()
+
+    def _maybe_microbatch_barrier(self) -> None:
+        """Rendezvous before the first shared-runtime launch of a microbatch."""
+        if (
+            self.config.external_barrier_mode == "microbatch_pre"
+            and self._forward_calls == self._backward_calls
+        ):
+            # The shared runtime serves every same-shape MoE layer. Forward and
+            # backward call counts become equal after each training microbatch.
+            self._ep_barrier()
 
     def _launch_distributed_kernel(self, compiled_kernel, kwargs) -> None:
         """Launch a reused FK kernel with the selected external rendezvous policy.
@@ -985,9 +990,7 @@ class FkRuntime:
         workloads to measure one or zero additional adapter-owned barriers.
         """
         barrier_mode = self.config.external_barrier_mode
-        if barrier_mode == "nvshmem_pre":
-            self._ep_stream_barrier()
-        elif barrier_mode in ("pre_and_post", "pre"):
+        if barrier_mode in ("pre_and_post", "pre"):
             self._ep_barrier()
         compiled_kernel(**kwargs)
         if barrier_mode == "pre_and_post":
@@ -1316,6 +1319,7 @@ class FkRuntime:
         fc1: FkWeightView,
         fc2: FkWeightView,
     ) -> tuple[torch.Tensor, FkForwardContext]:
+        self._maybe_microbatch_barrier()
         self._forward_calls += 1
         self._debug("forward_enter")
         routes = self._pad_routes(activation, router_weights, top_experts)

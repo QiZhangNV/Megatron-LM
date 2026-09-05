@@ -871,8 +871,9 @@ class TransformerConfig(ModelParallelConfig):
 
     ``pre_and_post`` preserves the conservative initial integration behavior,
     ``pre`` keeps one host-synchronous rendezvous before each launch,
-    ``nvshmem_pre`` keeps only the stream-ordered NVSHMEM rendezvous before each
-    launch, and ``none`` relies on the FK kernel-tail back-to-back protocol.
+    ``microbatch_pre`` keeps one host-synchronous rendezvous before the first
+    shared-runtime forward of each training microbatch, and ``none`` relies on
+    the FK kernel-tail back-to-back protocol.
     """
 
     fk_bwd_epi_flag_batch: Tuple[int, int] = field(
@@ -2369,7 +2370,7 @@ class TransformerConfig(ModelParallelConfig):
             supported_fk_external_barrier_modes = {
                 "pre_and_post",
                 "pre",
-                "nvshmem_pre",
+                "microbatch_pre",
                 "none",
             }
             if self.fk_external_barrier_mode not in supported_fk_external_barrier_modes:
