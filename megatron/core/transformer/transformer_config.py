@@ -873,7 +873,10 @@ class TransformerConfig(ModelParallelConfig):
     ``pre`` keeps one host-synchronous rendezvous before each launch,
     ``stream_pre_host_post`` matches FK's eager repeated-launch benchmark with
     a stream-ordered NVSHMEM barrier before each launch and one host CUDA wait
-    after it, and ``none`` relies on the FK kernel-tail back-to-back protocol.
+    after it, ``stream_pre_and_post`` replaces that host wait with a second
+    stream-ordered NVSHMEM barrier so downstream consumers wait for peer writes
+    without serializing Python, and ``none`` relies on the FK kernel-tail
+    back-to-back protocol.
     """
 
     fk_bwd_epi_flag_batch: Tuple[int, int] = field(
@@ -2371,6 +2374,7 @@ class TransformerConfig(ModelParallelConfig):
                 "pre_and_post",
                 "pre",
                 "stream_pre_host_post",
+                "stream_pre_and_post",
                 "none",
             }
             if self.fk_external_barrier_mode not in supported_fk_external_barrier_modes:
