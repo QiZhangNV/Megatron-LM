@@ -77,6 +77,15 @@ def test_fk_direct_col_quant_context_reaches_runtime_config():
     assert runtime_config.direct_col_quant_context
 
 
+def test_fk_route_count_reduce_backend_reaches_runtime_config():
+    config = _fk_transformer_config(fk_route_count_reduce_backend="nvshmem")
+    runtime_config = fk_runtime.FkRuntimeConfig.from_transformer_config(
+        config, num_local_experts=1
+    )
+
+    assert runtime_config.route_count_reduce_backend == "nvshmem"
+
+
 def test_fk_workspace_reset_mode_reaches_runtime_config():
     config = _fk_transformer_config(fk_bwd_workspace_reset_mode="counters_only")
     runtime_config = fk_runtime.FkRuntimeConfig.from_transformer_config(
@@ -505,6 +514,71 @@ def test_fk_route_counts_match_bincount_without_host_state():
     assert torch.equal(counts, torch.bincount(top_experts.flatten(), minlength=8))
 
 
+def test_fk_nccl_route_count_reduce_uses_ep_group(monkeypatch):
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    runtime.config = types.SimpleNamespace(route_count_reduce_backend="nccl")
+    runtime.ep_group = object()
+    calls = []
+
+    def all_reduce(counts, *, op, group):
+        calls.append((counts, op, group))
+
+    monkeypatch.setattr(fk_runtime.dist, "all_reduce", all_reduce)
+    counts = torch.tensor([1, 2, 3], dtype=torch.int64)
+
+    reduced = runtime._reduce_route_counts(counts)
+
+    assert reduced is counts
+    assert len(calls) == 1
+    actual_counts, actual_op, actual_group = calls[0]
+    assert actual_counts is counts
+    assert actual_op == fk_runtime.dist.ReduceOp.SUM
+    assert actual_group is runtime.ep_group
+
+
+def test_fk_nvshmem_route_count_reduce_uses_world_team(monkeypatch):
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    runtime.config = types.SimpleNamespace(route_count_reduce_backend="nvshmem")
+    runtime.ep_group = object()
+    runtime._route_counts_src = torch.empty(3, dtype=torch.int64)
+    runtime._route_counts_dst = torch.empty(3, dtype=torch.int64)
+    stream = object()
+    team_world = object()
+    calls = []
+
+    def reduce(team, destination, source, *, op, stream):
+        calls.append((team, destination, source, op, stream))
+        destination.copy_(source * 8)
+
+    nvshmem = types.SimpleNamespace(
+        Teams=types.SimpleNamespace(TEAM_WORLD=team_world), reduce=reduce
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(
+        fk_runtime,
+        "_prepare_system_dependencies",
+        lambda: types.SimpleNamespace(nvshmem=nvshmem),
+    )
+    monkeypatch.setattr(
+        fk_runtime.dist,
+        "all_reduce",
+        lambda *args, **kwargs: pytest.fail("NCCL must not be used"),
+    )
+    counts = torch.tensor([1, 2, 3], dtype=torch.int64)
+
+    reduced = runtime._reduce_route_counts(counts)
+
+    assert reduced is runtime._route_counts_dst
+    assert torch.equal(reduced, torch.tensor([8, 16, 24], dtype=torch.int64))
+    assert len(calls) == 1
+    actual_team, actual_dst, actual_src, actual_op, actual_stream = calls[0]
+    assert actual_team is team_world
+    assert actual_dst is runtime._route_counts_dst
+    assert actual_src is runtime._route_counts_src
+    assert actual_op == "sum"
+    assert actual_stream is stream
+
+
 def test_fk_columnwise_payload_transpose_reuses_cached_storage(monkeypatch):
     experts, rows, columns = 2, 4, 6
     row_data = torch.arange(experts * rows * columns, dtype=torch.uint8).reshape(
@@ -708,6 +782,7 @@ def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
         ({"fk_fwd_max_active_clusters": 0}, "active cluster"),
         ({"fk_bwd_max_active_clusters": -1}, "active cluster"),
         ({"fk_bwd_workspace_reset_mode": "payloads_too"}, "workspace_reset_mode"),
+        ({"fk_route_count_reduce_backend": "mpi"}, "route_count_reduce_backend"),
     ],
 )
 def test_fk_backend_rejects_unsupported_performance_mode(override, message):

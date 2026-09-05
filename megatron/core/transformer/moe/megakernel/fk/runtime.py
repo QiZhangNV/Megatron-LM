@@ -47,6 +47,7 @@ class FkRuntimeConfig:
     num_local_experts: int
     topk: int
     capacity_factor: float
+    route_count_reduce_backend: str
     swiglu_limit: float | None
     fwd_group_hint: int
     fwd_col_quant_num_ctas: int
@@ -69,6 +70,7 @@ class FkRuntimeConfig:
             num_local_experts=num_local_experts,
             topk=config.moe_router_topk,
             capacity_factor=config.fk_expert_rank_capacity_factor,
+            route_count_reduce_backend=config.fk_route_count_reduce_backend,
             swiglu_limit=config.activation_func_clamp_value,
             fwd_group_hint=config.fk_fwd_group_hint,
             fwd_col_quant_num_ctas=config.fk_fwd_col_quant_num_ctas,
@@ -885,6 +887,8 @@ class FkRuntime:
         self._col_requant_sizes = None
         self._fc2_dy_data = None
         self._fc2_dy_scale = None
+        self._route_counts_src = None
+        self._route_counts_dst = None
         self._forward_calls = 0
         self._backward_calls = 0
         self._debug_enabled = os.environ.get("FK_MCORE_DEBUG", "0") == "1"
@@ -897,6 +901,15 @@ class FkRuntime:
         self._precompile_wgrads(deps.cudnn_wgrad)
         self._debug_host_memory("runtime_init_after_wgrad_precompile")
         _select_fk_packages()
+        if config.route_count_reduce_backend == "nvshmem":
+            from moe_mxfp8_glu.mega_runner import _sym_zeros
+
+            self._route_counts_src = _sym_zeros(
+                (config.num_experts,), torch.int64
+            )
+            self._route_counts_dst = _sym_zeros(
+                (config.num_experts,), torch.int64
+            )
         if self.ep_rank == 0:
             print(
                 "FK_MCORE_RUNTIME "
@@ -904,6 +917,7 @@ class FkRuntime:
                 f"padded_tokens={self.padded_num_local_tokens} "
                 f"local_route_capacity={self.local_capacity} "
                 f"capacity_factor={config.capacity_factor} "
+                f"route_count_reduce={config.route_count_reduce_backend} "
                 f"token_back={config.bwd_token_back_mode} "
                 f"external_barrier={config.external_barrier_mode}",
                 flush=True,
@@ -1079,7 +1093,7 @@ class FkRuntime:
         )
         self._debug("pad_routes_before_counts_all_reduce")
         counts = _count_routes(top_experts, self.config.num_experts)
-        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=self.ep_group)
+        counts = self._reduce_route_counts(counts)
         self._debug("pad_routes_after_counts_all_reduce")
         padded_counts, dummy_experts_by_source_rank = build_route_padding_tensors(
             counts,
@@ -1124,6 +1138,25 @@ class FkRuntime:
             padded_counts=padded_counts,
             original_tokens=self.num_local_tokens,
         )
+
+    def _reduce_route_counts(self, counts: torch.Tensor) -> torch.Tensor:
+        """Sum per-rank route counts over the MCore EP/NVSHMEM world."""
+        if self.config.route_count_reduce_backend == "nccl":
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=self.ep_group)
+            return counts
+
+        if self._route_counts_src is None or self._route_counts_dst is None:
+            raise RuntimeError("FK NVSHMEM route-count buffers were not initialized")
+        self._route_counts_src.copy_(counts)
+        deps = _prepare_system_dependencies()
+        deps.nvshmem.reduce(
+            deps.nvshmem.Teams.TEAM_WORLD,
+            self._route_counts_dst,
+            self._route_counts_src,
+            op="sum",
+            stream=torch.cuda.current_stream(),
+        )
+        return self._route_counts_dst
 
     def _stage_row_quant(
         self,
@@ -1736,6 +1769,14 @@ class FkRuntime:
         deps = _SYSTEM_DEPS
         if deps is None:
             return
+        for name in ("_route_counts_src", "_route_counts_dst"):
+            tensor = getattr(self, name, None)
+            if tensor is not None:
+                try:
+                    deps.nvshmem.free_tensor(tensor)
+                except Exception:  # noqa: BLE001
+                    pass
+            setattr(self, name, None)
         for runner, names in (
             (
                 self.forward_runner,

@@ -835,6 +835,14 @@ class TransformerConfig(ModelParallelConfig):
     still requires enough headroom to cover per-expert padding.
     """
 
+    fk_route_count_reduce_backend: str = "nccl"
+    """Collective backend for FK's global route-count padding plan.
+
+    The conservative default is NCCL. The NVSHMEM mode reuses FK's EP-scoped
+    NVSHMEM world and symmetric buffers, avoiding one NCCL all-reduce per
+    routed forward while keeping the same global counts.
+    """
+
     fk_fwd_group_hint: int = 256
     """Static scheduling group hint used by the FK forward kernel."""
 
@@ -2343,6 +2351,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("FK currently requires SwiGLU")
             if self.fk_expert_rank_capacity_factor < 1.0:
                 raise ValueError("fk_expert_rank_capacity_factor must be at least 1.0")
+            supported_fk_route_count_reduce_backends = {"nccl", "nvshmem"}
+            if (
+                self.fk_route_count_reduce_backend
+                not in supported_fk_route_count_reduce_backends
+            ):
+                raise ValueError(
+                    "fk_route_count_reduce_backend must be one of "
+                    f"{sorted(supported_fk_route_count_reduce_backends)}"
+                )
             if self.fk_fwd_group_hint <= 0 or self.fk_fwd_col_quant_num_ctas <= 0:
                 raise ValueError("FK forward scheduling values must be positive")
             if any(
