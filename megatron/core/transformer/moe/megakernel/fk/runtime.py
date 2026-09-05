@@ -971,16 +971,6 @@ class FkRuntime:
         _prepare_system_dependencies().nvshmem.barrier_all(stream)
         torch.cuda.synchronize()
 
-    def _maybe_microbatch_barrier(self) -> None:
-        """Rendezvous before the first shared-runtime launch of a microbatch."""
-        if (
-            self.config.external_barrier_mode == "microbatch_pre"
-            and self._forward_calls == self._backward_calls
-        ):
-            # The shared runtime serves every same-shape MoE layer. Forward and
-            # backward call counts become equal after each training microbatch.
-            self._ep_barrier()
-
     def _launch_distributed_kernel(self, compiled_kernel, kwargs) -> None:
         """Launch a reused FK kernel with the selected external rendezvous policy.
 
@@ -992,9 +982,18 @@ class FkRuntime:
         barrier_mode = self.config.external_barrier_mode
         if barrier_mode in ("pre_and_post", "pre"):
             self._ep_barrier()
+        elif barrier_mode == "stream_pre_host_post":
+            # Match FK's repeated-launch performance harness: order a device-
+            # side NVSHMEM rendezvous before the launch, then wait for local
+            # completion below. This preserves the symmetric-workspace reuse
+            # protocol without inserting a ProcessGroupNCCL barrier.
+            stream = torch.cuda.current_stream()
+            _prepare_system_dependencies().nvshmem.barrier_all(stream)
         compiled_kernel(**kwargs)
         if barrier_mode == "pre_and_post":
             self._ep_barrier()
+        elif barrier_mode == "stream_pre_host_post":
+            torch.cuda.synchronize()
 
     def _precompile_wgrads(self, cudnn_wgrad) -> None:
         counts = torch.full(
@@ -1319,7 +1318,6 @@ class FkRuntime:
         fc1: FkWeightView,
         fc2: FkWeightView,
     ) -> tuple[torch.Tensor, FkForwardContext]:
-        self._maybe_microbatch_barrier()
         self._forward_calls += 1
         self._debug("forward_enter")
         routes = self._pad_routes(activation, router_weights, top_experts)

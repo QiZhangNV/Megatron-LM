@@ -413,7 +413,6 @@ def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
     [
         ("pre_and_post", ["barrier", ("kernel", {"value": 7}), "barrier"]),
         ("pre", ["barrier", ("kernel", {"value": 7})]),
-        ("microbatch_pre", [("kernel", {"value": 7})]),
         ("none", [("kernel", {"value": 7})]),
     ],
 )
@@ -429,6 +428,36 @@ def test_fk_reused_kernel_external_barrier_modes(barrier_mode, expected):
     runtime._launch_distributed_kernel(compiled_kernel, {"value": 7})
 
     assert events == expected
+
+
+def test_fk_stream_pre_host_post_matches_repeated_launch_protocol(monkeypatch):
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    runtime.config = types.SimpleNamespace(external_barrier_mode="stream_pre_host_post")
+    stream = object()
+    events = []
+    nvshmem = types.SimpleNamespace(
+        barrier_all=lambda actual_stream: events.append(("nvshmem", actual_stream))
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: events.append("cuda_synchronize")
+    )
+    monkeypatch.setattr(
+        fk_runtime,
+        "_prepare_system_dependencies",
+        lambda: types.SimpleNamespace(nvshmem=nvshmem),
+    )
+
+    runtime._launch_distributed_kernel(
+        lambda **kwargs: events.append(("kernel", kwargs)), {"value": 7}
+    )
+
+    assert events == [
+        ("nvshmem", stream),
+        ("kernel", {"value": 7}),
+        "cuda_synchronize",
+    ]
 
 
 def test_fk_ep_barrier_uses_only_stream_ordered_nvshmem_during_capture(monkeypatch):
@@ -457,27 +486,6 @@ def test_fk_ep_barrier_uses_only_stream_ordered_nvshmem_during_capture(monkeypat
     runtime._ep_barrier()
 
     assert events == [("nvshmem", stream)]
-
-
-def test_fk_microbatch_barrier_runs_only_when_forward_and_backward_counts_match():
-    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
-    runtime.config = types.SimpleNamespace(external_barrier_mode="microbatch_pre")
-    runtime._forward_calls = 10
-    runtime._backward_calls = 10
-    events = []
-    runtime._ep_barrier = lambda: events.append("barrier")
-
-    runtime._maybe_microbatch_barrier()
-    assert events == ["barrier"]
-
-    runtime._forward_calls += 1
-    runtime._maybe_microbatch_barrier()
-    assert events == ["barrier"]
-
-    runtime.config = types.SimpleNamespace(external_barrier_mode="pre")
-    runtime._forward_calls = runtime._backward_calls
-    runtime._maybe_microbatch_barrier()
-    assert events == ["barrier"]
 
 
 def test_fk_route_counts_match_bincount_without_host_state():
@@ -668,7 +676,7 @@ def test_fk_backend_accepts_supported_token_back_modes(token_back_mode):
 
 
 @pytest.mark.parametrize(
-    "barrier_mode", ["pre_and_post", "pre", "microbatch_pre", "none"]
+    "barrier_mode", ["pre_and_post", "pre", "stream_pre_host_post", "none"]
 )
 def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
     config = _fk_transformer_config(fk_external_barrier_mode=barrier_mode)
@@ -689,6 +697,14 @@ def test_fk_backend_accepts_external_barrier_modes(barrier_mode):
 def test_fk_backend_rejects_unsupported_performance_mode(override, message):
     with pytest.raises(ValueError, match=message):
         _fk_transformer_config(**override)
+
+
+def test_fk_backend_rejects_stream_host_sync_during_cuda_graph_capture():
+    with pytest.raises(ValueError, match="eager-only"):
+        _fk_transformer_config(
+            fk_external_barrier_mode="stream_pre_host_post",
+            cuda_graph_impl="full_iteration",
+        )
 
 
 def test_fk_shared_expert_keeps_native_mxfp8_config():

@@ -871,9 +871,9 @@ class TransformerConfig(ModelParallelConfig):
 
     ``pre_and_post`` preserves the conservative initial integration behavior,
     ``pre`` keeps one host-synchronous rendezvous before each launch,
-    ``microbatch_pre`` keeps one host-synchronous rendezvous before the first
-    shared-runtime forward of each training microbatch, and ``none`` relies on
-    the FK kernel-tail back-to-back protocol.
+    ``stream_pre_host_post`` matches FK's eager repeated-launch benchmark with
+    a stream-ordered NVSHMEM barrier before each launch and one host CUDA wait
+    after it, and ``none`` relies on the FK kernel-tail back-to-back protocol.
     """
 
     fk_bwd_epi_flag_batch: Tuple[int, int] = field(
@@ -2370,13 +2370,21 @@ class TransformerConfig(ModelParallelConfig):
             supported_fk_external_barrier_modes = {
                 "pre_and_post",
                 "pre",
-                "microbatch_pre",
+                "stream_pre_host_post",
                 "none",
             }
             if self.fk_external_barrier_mode not in supported_fk_external_barrier_modes:
                 raise ValueError(
                     "fk_external_barrier_mode must be one of "
                     f"{sorted(supported_fk_external_barrier_modes)}"
+                )
+            if (
+                self.fk_external_barrier_mode == "stream_pre_host_post"
+                and self.cuda_graph_impl != "none"
+            ):
+                raise ValueError(
+                    "fk_external_barrier_mode=stream_pre_host_post is eager-only; "
+                    "use pre/pre_and_post for CUDA graph capture"
                 )
             if len(self.fk_bwd_epi_flag_batch) != 2 or any(
                 value <= 0 for value in self.fk_bwd_epi_flag_batch
