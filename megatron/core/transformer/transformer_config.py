@@ -891,8 +891,11 @@ class TransformerConfig(ModelParallelConfig):
     a stream-ordered NVSHMEM barrier before each launch and one host CUDA wait
     after it, ``stream_pre_host_stream_post`` narrows that host wait to the
     current CUDA stream so other communication streams can remain overlapped,
-    and ``none`` relies on the FK kernel-tail back-to-back protocol. Host-free
-    stream barriers are not safe for repeated eager iterations.
+    ``stream_pre_host_prelaunch`` submits the next route preparation before a
+    stream-ordered NVSHMEM rendezvous and host wait, then reuses the symmetric
+    workspace and launches FK without a post-launch wait, and ``none`` relies
+    on the FK kernel-tail back-to-back protocol. Host-free stream barriers are
+    not safe for repeated eager iterations.
     """
 
     fk_external_host_sync_interval: int = 1
@@ -2415,6 +2418,7 @@ class TransformerConfig(ModelParallelConfig):
                 "pre",
                 "stream_pre_host_post",
                 "stream_pre_host_stream_post",
+                "stream_pre_host_prelaunch",
                 "none",
             }
             if self.fk_external_barrier_mode not in supported_fk_external_barrier_modes:
@@ -2429,6 +2433,7 @@ class TransformerConfig(ModelParallelConfig):
                 in {
                     "stream_pre_host_post",
                     "stream_pre_host_stream_post",
+                    "stream_pre_host_prelaunch",
                 }
                 and self.cuda_graph_impl != "none"
             ):

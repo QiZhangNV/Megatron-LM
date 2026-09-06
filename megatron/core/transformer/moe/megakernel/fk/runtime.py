@@ -1030,6 +1030,22 @@ class FkRuntime:
                 torch.cuda.current_stream().synchronize()
                 self._launches_since_host_sync = 0
 
+    def _pace_before_workspace_reuse(self) -> None:
+        """Wait for the preceding FK launch after current route work is queued.
+
+        This mode deliberately puts the host wait before writes to FK's reused
+        symmetric workspace, rather than after the preceding persistent kernel.
+        Forward route counting/padding and backward input padding are therefore
+        already submitted on the current stream when ranks rendezvous. The
+        barrier still protects the shared FK communication workspace, while the
+        following FK kernel can return to MCore without another host wait.
+        """
+        if self.config.external_barrier_mode != "stream_pre_host_prelaunch":
+            return
+        stream = torch.cuda.current_stream()
+        _prepare_system_dependencies().nvshmem.barrier_all(stream)
+        stream.synchronize()
+
     def _precompile_wgrads(self, cudnn_wgrad) -> None:
         counts = torch.full(
             (self.config.num_local_experts,),
@@ -1345,6 +1361,7 @@ class FkRuntime:
         import cuda.bindings.driver as cuda
 
         runner = self.forward_runner
+        self._pace_before_workspace_reuse()
         self._set_forward_weights(runner, fc1, fc2)
         runner.my_topk_idx.copy_(routes.top_experts)
         runner.my_topk_weights.copy_(routes.router_weights)
@@ -1653,6 +1670,7 @@ class FkRuntime:
         import cuda.bindings.driver as cuda
 
         runner = self.backward_runner
+        self._pace_before_workspace_reuse()
         self._set_backward_weights(runner, fc1, fc2)
         runner.my_topk_idx.copy_(context.top_experts)
         runner.my_topk_weights.copy_(context.router_weights)

@@ -442,6 +442,7 @@ def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
     [
         ("pre_and_post", ["barrier", ("kernel", {"value": 7}), "barrier"]),
         ("pre", ["barrier", ("kernel", {"value": 7})]),
+        ("stream_pre_host_prelaunch", [("kernel", {"value": 7})]),
         ("none", [("kernel", {"value": 7})]),
     ],
 )
@@ -532,6 +533,38 @@ def test_fk_current_stream_host_sync_can_be_bounded(monkeypatch):
         ("nvshmem", stream),
         ("kernel", {"value": 2}),
         "stream_synchronize",
+    ]
+
+
+def test_fk_prelaunch_pacing_waits_after_stream_rendezvous(monkeypatch):
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    runtime.config = types.SimpleNamespace(
+        external_barrier_mode="stream_pre_host_prelaunch"
+    )
+    events = []
+    stream = types.SimpleNamespace(
+        synchronize=lambda: events.append("stream_synchronize")
+    )
+    nvshmem = types.SimpleNamespace(
+        barrier_all=lambda actual_stream: events.append(("nvshmem", actual_stream))
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(
+        fk_runtime,
+        "_prepare_system_dependencies",
+        lambda: types.SimpleNamespace(nvshmem=nvshmem),
+    )
+
+    runtime._pace_before_workspace_reuse()
+    runtime._launch_distributed_kernel(
+        lambda **kwargs: events.append(("kernel", kwargs)), {"value": 7}
+    )
+
+    assert events == [
+        ("nvshmem", stream),
+        "stream_synchronize",
+        ("kernel", {"value": 7}),
     ]
 
 
@@ -822,6 +855,7 @@ def test_fk_backend_accepts_supported_token_back_modes(token_back_mode):
         "pre",
         "stream_pre_host_post",
         "stream_pre_host_stream_post",
+        "stream_pre_host_prelaunch",
         "none",
     ],
 )
@@ -851,7 +885,11 @@ def test_fk_backend_rejects_unsupported_performance_mode(override, message):
 
 @pytest.mark.parametrize(
     "barrier_mode",
-    ["stream_pre_host_post", "stream_pre_host_stream_post"],
+    [
+        "stream_pre_host_post",
+        "stream_pre_host_stream_post",
+        "stream_pre_host_prelaunch",
+    ],
 )
 def test_fk_backend_rejects_stream_host_sync_during_cuda_graph_capture(barrier_mode):
     with pytest.raises(ValueError, match="eager-only"):
