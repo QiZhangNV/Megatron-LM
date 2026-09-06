@@ -442,6 +442,10 @@ def test_fk_cudnn_operands_flatten_2d_runner_scale_workspace():
     [
         ("pre_and_post", ["barrier", ("kernel", {"value": 7}), "barrier"]),
         ("pre", ["barrier", ("kernel", {"value": 7})]),
+        (
+            "eager_pre_and_post_graph_none",
+            ["barrier", ("kernel", {"value": 7}), "barrier"],
+        ),
         ("stream_pre_host_prelaunch", [("kernel", {"value": 7})]),
         ("none", [("kernel", {"value": 7})]),
     ],
@@ -458,6 +462,22 @@ def test_fk_reused_kernel_external_barrier_modes(barrier_mode, expected):
     runtime._launch_distributed_kernel(compiled_kernel, {"value": 7})
 
     assert events == expected
+
+
+def test_fk_phase_aware_barrier_omits_external_rendezvous_during_capture(monkeypatch):
+    runtime = fk_runtime.FkRuntime.__new__(fk_runtime.FkRuntime)
+    runtime.config = types.SimpleNamespace(
+        external_barrier_mode="eager_pre_and_post_graph_none"
+    )
+    events = []
+    runtime._ep_barrier = lambda: events.append("barrier")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    runtime._launch_distributed_kernel(
+        lambda **kwargs: events.append(("kernel", kwargs)), {"value": 7}
+    )
+
+    assert events == [("kernel", {"value": 7})]
 
 
 @pytest.mark.parametrize(
@@ -856,6 +876,7 @@ def test_fk_backend_accepts_supported_token_back_modes(token_back_mode):
         "stream_pre_host_post",
         "stream_pre_host_stream_post",
         "stream_pre_host_prelaunch",
+        "eager_pre_and_post_graph_none",
         "none",
     ],
 )

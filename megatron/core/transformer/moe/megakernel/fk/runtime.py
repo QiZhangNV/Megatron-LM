@@ -1005,6 +1005,17 @@ class FkRuntime:
         workloads to measure one or zero additional adapter-owned barriers.
         """
         barrier_mode = self.config.external_barrier_mode
+        if barrier_mode == "eager_pre_and_post_graph_none":
+            # EP64 needs conservative workspace pacing during the eager graph
+            # warmup, while recording those per-launch NVSHMEM rendezvous in a
+            # large full-iteration graph can deadlock its first replay. The FK
+            # kernel tail already drains peer writes and resets shared counters,
+            # so capture the same barrier-free back-to-back protocol used by the
+            # validated replay path. Replay does not re-enter Python and thus
+            # inherits the barrier-free launch sequence recorded here.
+            barrier_mode = (
+                "none" if torch.cuda.is_current_stream_capturing() else "pre_and_post"
+            )
         if barrier_mode in ("pre_and_post", "pre"):
             self._ep_barrier()
         elif barrier_mode in ("stream_pre_host_post", "stream_pre_host_stream_post"):
