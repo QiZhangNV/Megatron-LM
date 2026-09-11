@@ -83,8 +83,6 @@ class MoKMegakernel(MegakernelBackend):
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
-        if config.moe_shared_expert_gate and self.use_mxfp8_weights:
-            raise ValueError("MOK shared-expert output gate requires BF16 routed experts")
         if self.use_mxfp8_weights:
             from megatron.core import fp8_utils
 

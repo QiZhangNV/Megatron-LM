@@ -452,8 +452,34 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False)
     return module, shared, functional
 
 
-def test_backend_rejects_gated_mxfp8_before_importing_te_runtime(monkeypatch):
-    with pytest.raises(ValueError, match="output gate requires BF16 routed experts"):
+@pytest.fixture
+def mxfp8_runtime_available(monkeypatch):
+    """Isolate adapter contracts from the installed TE runtime's capabilities."""
+    from megatron.core import fp8_utils
+
+    monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", object())
+
+
+@pytest.mark.parametrize("single_grouped", [False, True])
+def test_backend_accepts_gated_mxfp8_with_bf16_shared_alias(
+    monkeypatch, mxfp8_runtime_available, single_grouped
+):
+    module, shared, _ = _mock_backend(
+        monkeypatch, single_grouped=single_grouped, gated=True, mxfp8=True
+    )
+    assert module.use_mxfp8_weights
+    assert module.shared_output_gate_weight is shared.gate_weight
+    assert module.shared_output_gate_weight.dtype == torch.bfloat16
+    assert module.shared_fc1_weight is shared.linear_fc1.weight
+    assert module.shared_fc2_weight is shared.linear_fc2.weight
+    assert module.shared_fc1_weight.dtype == module.shared_fc2_weight.dtype == torch.bfloat16
+
+
+def test_backend_rejects_gated_mxfp8_without_te_post_all_gather_processing(monkeypatch):
+    from megatron.core import fp8_utils
+
+    monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", None)
+    with pytest.raises(RuntimeError, match="post_all_gather_processing support"):
         _mock_backend(monkeypatch, gated=True, mxfp8=True)
 
 
@@ -501,8 +527,13 @@ def test_register_shared_output_gate_validates_native_parameter(monkeypatch, inv
 
 @pytest.mark.parametrize("single_grouped", [False, True])
 @pytest.mark.parametrize("gated", [False, True])
-def test_forward_keeps_fixed_gate_slot_and_param_gather_alias(monkeypatch, single_grouped, gated):
-    module, shared, _ = _mock_backend(monkeypatch, single_grouped=single_grouped, gated=gated)
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_forward_keeps_fixed_gate_slot_and_param_gather_alias(
+    monkeypatch, mxfp8_runtime_available, single_grouped, gated, mxfp8
+):
+    module, shared, _ = _mock_backend(
+        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8
+    )
     probs = torch.ones((2, 2), dtype=torch.float32)
     experts = torch.zeros((2, 2), dtype=torch.int32)
     monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
@@ -545,11 +576,12 @@ class _RuntimeContext:
 
 @pytest.mark.parametrize("single_grouped", [False, True])
 @pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("mxfp8", [False, True])
 def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
-    monkeypatch, single_grouped, gated
+    monkeypatch, mxfp8_runtime_available, single_grouped, gated, mxfp8
 ):
     module, shared, functional = _mock_backend(
-        monkeypatch, single_grouped=single_grouped, gated=gated
+        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8
     )
     parameters = module.autograd_routed_parameters + (
         shared.linear_fc1.weight,
@@ -561,22 +593,35 @@ def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
         shared.gate_weight.main_grad = torch.full_like(
             shared.gate_weight, 0.25, dtype=torch.float32
         )
-    monkeypatch.setattr(
-        module,
-        "quantized_routed_weights",
-        lambda: (module.routed_fc1_parameters[0], module.routed_fc2_parameters[0]),
-    )
+    # Opaque payloads exercise the bridge's view selection without pretending
+    # that BF16 mock Parameters contain real MXFP8 storage. Numerical/native TE
+    # storage validation belongs to the kernel and weight-adaptation tests.
+    fc1_view, fc2_view = object(), object()
+    if mxfp8 and single_grouped:
+        fc1_view = tuple(object() for _ in range(4))
+        fc2_view = tuple(object() for _ in range(4))
+    monkeypatch.setattr(module, "quantized_routed_weights", lambda: (fc1_view, fc2_view))
     functional.get_workspace = lambda *args, **kwargs: object()
     functional.build_schedule = lambda *args, **kwargs: object()
     calls = []
 
     def forward(*args, **kwargs):
         assert kwargs.get("shared_output_gate_weight") is shared.gate_weight
+        assert args[8] is args[9]
+        if mxfp8 and single_grouped:
+            assert args[8] == fc1_view[:2] and args[10] == fc2_view[:2]
+        else:
+            assert args[8] is fc1_view and args[10] is fc2_view
         return args[3].clone(), object()
 
     def backward(*args, **kwargs):
         calls.append(kwargs)
         assert kwargs.get("shared_output_gate_weight") is shared.gate_weight
+        assert args[10] is args[11] is fc1_view
+        if mxfp8 and single_grouped:
+            assert args[12] == fc2_view[2:]
+        else:
+            assert args[12] is fc2_view
         gate_grad = kwargs.get("shared_output_gate_main_grad")
         if gated:
             assert gate_grad is shared.gate_weight.main_grad and gate_grad.dtype == torch.float32
@@ -637,8 +682,11 @@ def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
 
 
 @pytest.mark.parametrize("main_grad", [None, "bf16"])
-def test_runtime_rejects_missing_or_bf16_output_gate_main_grad(monkeypatch, main_grad):
-    module, shared, functional = _mock_backend(monkeypatch)
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_runtime_rejects_missing_or_bf16_output_gate_main_grad(
+    monkeypatch, mxfp8_runtime_available, main_grad, mxfp8
+):
+    module, shared, functional = _mock_backend(monkeypatch, mxfp8=mxfp8)
     if main_grad == "bf16":
         shared.gate_weight.main_grad = torch.zeros_like(shared.gate_weight)
     parameters = module.autograd_routed_parameters + (
