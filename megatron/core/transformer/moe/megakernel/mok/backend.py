@@ -151,6 +151,21 @@ class MoKMegakernel(MegakernelBackend):
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
 
+    def _apply(self, fn, recurse=True):
+        """Invalidate views without converting native-owned parameter aliases.
+
+        MoELayer converts the native owners before visiting this adapter. Their
+        Parameter identities remain authoritative; applying fn again can make
+        PyTorch swap MXFP8 tensor state and discard external DDP metadata.
+        This private adapter owns no parameters, buffers, or child modules:
+        callers must convert the enclosing MoELayer, not this adapter directly.
+        """
+        del fn, recurse
+        self._routed_weight_view_cache = None
+        self._split_main_grad_descriptor_cache = None
+        self.is_first_microbatch = True
+        return self
+
     @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return the MCore-owned routed FC1 parameters."""

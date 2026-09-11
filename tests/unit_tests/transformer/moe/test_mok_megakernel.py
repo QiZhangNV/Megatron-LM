@@ -483,6 +483,57 @@ def test_backend_rejects_gated_mxfp8_without_te_post_all_gather_processing(monke
         _mock_backend(monkeypatch, gated=True, mxfp8=True)
 
 
+@pytest.mark.parametrize("single_grouped", [False, True])
+@pytest.mark.parametrize("gated", [False, True])
+def test_apply_converts_canonical_owners_once_and_preserves_alias_metadata(
+    monkeypatch, single_grouped, gated
+):
+    module, shared, _ = _mock_backend(monkeypatch, single_grouped=single_grouped, gated=gated)
+    # Plain Parameters model the identity-preserving owner contract here; real
+    # TE MXFP8 cuda/Float16Module conversion is covered by integration tests.
+    monkeypatch.setattr(torch.__future__, "get_swap_module_params_on_conversion", lambda: False)
+    monkeypatch.setattr(
+        torch.__future__, "get_overwrite_module_params_on_conversion", lambda: False
+    )
+    owners = torch.nn.Module()
+    owners.add_module("experts", torch.nn.ParameterList(module.autograd_routed_parameters))
+    owners.add_module("shared_experts", shared)
+    owners.add_module("megakernel_experts", module)
+    aliases = dict(module.named_parameters(recurse=False))
+    routed_ids = {id(param) for param in module.autograd_routed_parameters}
+    marker = object()
+    main_grads = {}
+    for name, param in aliases.items():
+        param.allreduce = id(param) not in routed_ids
+        param.partition_stride = 1
+        param.audit_marker = marker
+        param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+        main_grads[name] = param.main_grad
+    module._routed_weight_view_cache = object()
+    module._split_main_grad_descriptor_cache = object()
+    module.is_first_microbatch = False
+    calls = []
+
+    def convert(param):
+        calls.append(id(param))
+        return param.to(torch.float32)
+
+    assert owners._apply(convert) is owners
+    assert sorted(calls) == sorted(id(param) for param in aliases.values())
+    for name, param in aliases.items():
+        assert module.get_parameter(name) is param and param.dtype == torch.float32
+        assert param.allreduce is (id(param) not in routed_ids)
+        assert param.partition_stride == 1 and param.audit_marker is marker
+        assert param.main_grad is main_grads[name]
+    assert module._routed_weight_view_cache is None
+    assert module._split_main_grad_descriptor_cache is None
+    assert module.is_first_microbatch
+    assert (
+        module._apply(lambda _: pytest.fail("adapter must not transform aliases"), recurse=False)
+        is module
+    )
+
+
 def test_output_gate_alias_participates_in_ddp_hooks_without_double_accumulation(monkeypatch):
     from megatron.core.distributed import distributed_data_parallel as ddp_module
 
