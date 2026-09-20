@@ -806,8 +806,9 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_megakernel_backend is not None:
             if intermediate_tensors is not None:
                 raise RuntimeError(
-                    "The selected MoE megakernel backend does not support partial MoE "
-                    "CUDA-graph capture; remove moe_router/moe_preprocess from cuda_graph_modules"
+                    "The selected MoE megakernel backend does not support the native partial MoE "
+                    "intermediate_tensors protocol; use Transformer Engine moe_router capture "
+                    "without moe_preprocess instead"
                 )
 
             def megakernel_forward(hidden_states, padding_mask):
@@ -816,22 +817,29 @@ class MoELayer(BaseMoELayer):
                 )
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
-            if self.moe_layer_recompute and self.training:
-                if self.config.fp8 or self.config.fp4:
-                    output = te_checkpoint(
-                        megakernel_forward,
-                        False,
-                        tensor_parallel.random.get_cuda_rng_tracker,
-                        self.tp_group,
-                        hidden_states,
-                        padding_mask,
-                    )
+            try:
+                if self.moe_layer_recompute and self.training:
+                    if self.config.fp8 or self.config.fp4:
+                        output = te_checkpoint(
+                            megakernel_forward,
+                            False,
+                            tensor_parallel.random.get_cuda_rng_tracker,
+                            self.tp_group,
+                            hidden_states,
+                            padding_mask,
+                        )
+                    else:
+                        output = tensor_parallel.checkpoint(
+                            megakernel_forward, False, hidden_states, padding_mask
+                        )
                 else:
-                    output = tensor_parallel.checkpoint(
-                        megakernel_forward, False, hidden_states, padding_mask
-                    )
-            else:
-                output = megakernel_forward(hidden_states, padding_mask)
+                    output = megakernel_forward(hidden_states, padding_mask)
+            except MoECudaGraphPartialCaptureSignal as signal:
+                if signal.return_step != "route":
+                    raise
+                # The fused backend computes shared experts in the eager tail,
+                # so router capture has no independent shared-expert output.
+                return signal.get_early_return_outputs(hidden_states, shared_expert_output=None)
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine

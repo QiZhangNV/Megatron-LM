@@ -3554,17 +3554,22 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "MOK does not support per-layer whole-layer CUDA Graph capture"
                     )
-                if any(
-                    scope in self.cuda_graph_modules
-                    for scope in (
-                        CudaGraphModule.moe,
-                        CudaGraphModule.moe_router,
-                        CudaGraphModule.moe_preprocess,
-                    )
-                ):
+                unsupported_scopes = {CudaGraphModule.moe, CudaGraphModule.moe_preprocess}
+                if self.cuda_graph_impl == "local":
+                    unsupported_scopes.add(CudaGraphModule.moe_router)
+                if any(scope in unsupported_scopes for scope in self.cuda_graph_modules):
                     raise ValueError(
                         "MOK does not support per-layer CUDA Graph scopes containing "
-                        "moe/moe_router/moe_preprocess"
+                        "moe/moe_preprocess, or moe_router with cuda_graph_impl='local'"
+                    )
+                if CudaGraphModule.moe_router in self.cuda_graph_modules:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        "With MOK, the 'moe_router' CUDA graph scope captures routing but "
+                        "excludes shared-expert computation. Shared experts remain enabled "
+                        "and are computed together with routed experts by MOK outside the "
+                        "CUDA graph.",
                     )
             elif self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")

@@ -52,6 +52,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _shared_expert_in_router_graph(config: TransformerConfig) -> bool:
+    """Whether router capture emits an independently computed shared-expert output."""
+    return (
+        config.moe_shared_expert_intermediate_size is not None
+        and not config.moe_shared_expert_overlap
+        and config.moe_megakernel_backend is None
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def _get_offloading_interface():
     """Get the offloading interface for fine-grained activation offloading."""
@@ -1403,10 +1412,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             submodules += [self.pre_mlp_layernorm, self.mlp]
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if _shared_expert_in_router_graph(self.config):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
@@ -1632,10 +1638,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # The inner residual is the last captured element; the mHC wrapper does not use it
         # (the n-stream BDA combines residual), so drop it.
         cuda_graph_output.pop()
-        if (
-            self.config.moe_shared_expert_intermediate_size is not None
-            and not self.config.moe_shared_expert_overlap
-        ):
+        if _shared_expert_in_router_graph(self.config):
             shared_expert_output = cuda_graph_output.pop()
 
         if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
@@ -1660,9 +1663,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             routing_map=routing_map,
             shared_expert_output=shared_expert_output,
         )
-        mlp_output_with_bias = self.mlp(hidden_states)
-        self.mlp.cudagraph_tensor_store.clear()
-        nvtx_range_pop(suffix="mlp")
+        try:
+            mlp_output_with_bias = self.mlp(hidden_states)
+        finally:
+            self.mlp.cudagraph_tensor_store.clear()
+            nvtx_range_pop(suffix="mlp")
         return mlp_output_with_bias
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
@@ -1694,10 +1699,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             shared_expert_output, routing_map = None, None
             # residual is the last element in the CUDA graph output.
             residual = cuda_graph_output.pop()
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if _shared_expert_in_router_graph(self.config):
                 # The shared expert output is the last second element in the CUDA graph output.
                 shared_expert_output = cuda_graph_output.pop()
 
@@ -1735,9 +1737,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
-            mlp_output_with_bias = apply_module(self.mlp)(hidden_states)
-            self.mlp.cudagraph_tensor_store.clear()
-            nvtx_range_pop(suffix="mlp")
+            try:
+                mlp_output_with_bias = apply_module(self.mlp)(hidden_states)
+            finally:
+                self.mlp.cudagraph_tensor_store.clear()
+                nvtx_range_pop(suffix="mlp")
 
             # If we early returned, layernorm recompute hooks were attached to the output buffer
             # of the cudagraph, so disable the recompute hooks inside _forward_post_mlp
@@ -2881,10 +2885,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_hc_h_post = cuda_graph_output.pop()
 
             shared_expert_output, routing_map = None, None
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if _shared_expert_in_router_graph(self.config):
                 shared_expert_output = cuda_graph_output.pop()
 
             if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
@@ -2927,9 +2928,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                     mlp_h_res,
                     mlp_hc_h_post,
                 )
-            mlp_output_with_bias = self.mlp(hidden_states)
-            self.mlp.cudagraph_tensor_store.clear()
-            nvtx_range_pop(suffix="mlp")
+            try:
+                mlp_output_with_bias = self.mlp(hidden_states)
+            finally:
+                self.mlp.cudagraph_tensor_store.clear()
+                nvtx_range_pop(suffix="mlp")
 
             # HC post-processing with fused h_res, h_post and BDA.
             recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm

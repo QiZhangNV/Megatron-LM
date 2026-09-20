@@ -109,6 +109,25 @@ but custom training scripts must do the same work themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+### MOK router capture
+
+With `--moe-megakernel-backend mok`, Transformer Engine supports
+`--cuda-graph-modules moe_router` and `--cuda-graph-modules attn moe_router`.
+Unlike the native MoE path, the `moe_router` scope **does not capture shared
+expert computation**. A configuration-time warning reports this difference.
+Shared experts remain enabled and execute together with the routed experts
+inside the eager MOK backend after graph replay.
+
+The graph returns hidden states, differentiable routing probabilities and the
+routing map, plus the layer's residual/mHC state. Replay feeds these tensors
+through the normal MOK module call without rerunning the router or independently
+adding a shared-expert output. Router-graph manual parameter-gather hooks cover
+only the captured modules; MOK's eager call retains its normal parameter hooks.
+
+MOK's `moe_preprocess`, whole-MoE and whole-layer per-layer scopes, and local
+router capture remain unsupported. Start validation without activation
+recompute/offload. Full-iteration graphs remain a separate supported path.
+
 ### mHC Attention Split
 
 For mHC selective recompute, `--mhc-recompute-attn-cuda-graph-split` keeps mHC aggregation and

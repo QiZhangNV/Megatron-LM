@@ -99,13 +99,12 @@ def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
     "cuda_graph_modules",
     [
         [CudaGraphModule.moe],
-        [CudaGraphModule.moe_router],
         [CudaGraphModule.moe_preprocess],
         [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
     ],
 )
 def test_mok_rejects_per_layer_cuda_graph_covering_moe(cuda_graph_impl, cuda_graph_modules):
-    with pytest.raises(ValueError, match="moe/moe_router/moe_preprocess"):
+    with pytest.raises(ValueError, match="moe/moe_preprocess"):
         _mok_transformer_config(
             cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
         )
@@ -119,3 +118,37 @@ def test_mok_accepts_per_layer_cuda_graph_outside_moe(cuda_graph_impl):
     )
 
     assert config.cuda_graph_modules == cuda_graph_modules
+
+
+@pytest.mark.parametrize("modules", [["moe_router"], ["attn", "moe_router"]])
+def test_mok_te_router_graph_warns_that_shared_experts_stay_eager(modules, caplog, monkeypatch):
+    monkeypatch.setattr("megatron.core._rank_utils.safe_get_rank", lambda: 0)
+    config = _mok_transformer_config(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=modules
+    )
+
+    assert CudaGraphModule.moe_router in config.cuda_graph_modules
+    assert "excludes shared-expert computation" in caplog.text
+    assert "Shared experts remain enabled" in caplog.text
+    assert "by MOK outside the CUDA graph" in caplog.text
+
+
+def test_mok_attention_graph_does_not_emit_shared_expert_warning(caplog):
+    _mok_transformer_config(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.attn]
+    )
+    assert "excludes shared-expert computation" not in caplog.text
+
+
+def test_mok_router_warning_is_silent_on_other_ranks(caplog, monkeypatch):
+    monkeypatch.setattr("megatron.core._rank_utils.safe_get_rank", lambda: 1)
+    _mok_transformer_config(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.moe_router]
+    )
+    assert "excludes shared-expert computation" not in caplog.text
+
+
+@pytest.mark.parametrize("modules", [["moe_router"], ["attn", "moe_router"]])
+def test_mok_local_router_capture_remains_unsupported(modules):
+    with pytest.raises(ValueError, match="moe_router with cuda_graph_impl='local'"):
+        _mok_transformer_config(cuda_graph_impl="local", cuda_graph_modules=modules)
