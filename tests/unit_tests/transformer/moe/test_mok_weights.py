@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -55,6 +56,14 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     "overrides",
     [
         {},
+        {"activation_func": situlu, "situ_glu_beta1": 2.0, "situ_glu_beta2": 8.0},
+        {
+            "activation_func": situlu,
+            "moe_shared_expert_gate": True,
+            "fp8": "hybrid",
+            "fp8_recipe": "mxfp8",
+            "fp8_param": True,
+        },
         {"moe_shared_expert_gate": True},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
