@@ -8,6 +8,10 @@ import torch.nn.functional as F
 
 from megatron.core.activations import situlu
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.megakernel import (
+    megakernel_fuses_shared_expert,
+    prepare_megakernel_shared_expert_config,
+)
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -70,6 +74,32 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
 )
 def test_mok_accepts_key_supported_configurations(overrides):
     assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
+
+
+def test_shared_execution_is_independent_of_activation_and_preserves_native_precision():
+    for activation in (F.silu, situlu):
+        assert megakernel_fuses_shared_expert(_mok_transformer_config(activation_func=activation))
+        for overrides in (
+            {"moe_megakernel_shared_expert_mode": "native"},
+            {"moe_latent_size": 64},
+            {"moe_shared_expert_intermediate_size": 512},
+            {"moe_shared_expert_intermediate_size": None},
+        ):
+            config = _mok_transformer_config(
+                activation_func=activation,
+                fp8="hybrid",
+                fp8_recipe="mxfp8",
+                fp8_param=True,
+                **overrides,
+            )
+            assert not megakernel_fuses_shared_expert(config)
+            assert prepare_megakernel_shared_expert_config(config) is config
+            assert config.fp8_param and config.fp8 == "hybrid"
+    for overrides in ({"moe_latent_size": 64}, {"moe_shared_expert_intermediate_size": 512}):
+        with pytest.raises(ValueError, match="Fused MOK shared execution requires"):
+            _mok_transformer_config(moe_megakernel_shared_expert_mode="fused", **overrides)
+    with pytest.raises(ValueError, match="must be auto, fused, or native"):
+        _mok_transformer_config(moe_megakernel_shared_expert_mode="invalid")
 
 
 @pytest.mark.parametrize(
