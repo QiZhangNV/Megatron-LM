@@ -887,6 +887,13 @@ class TransformerConfig(ModelParallelConfig):
     For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
     """
 
+    moe_megakernel_shared_expert_mode: str = "auto"
+    """Shared execution with a megakernel: auto fuses compatible shared MLPs,
+    fused requires compatibility, and native executes shared experts in MCore.
+    Activation selection is independent. Native shared experts retain the model's
+    precision policy; MOK-fused shared experts use BF16.
+    """
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -2639,8 +2646,15 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
+        if self.moe_megakernel_shared_expert_mode not in ("auto", "fused", "native"):
+            raise ValueError("moe_megakernel_shared_expert_mode must be auto, fused, or native")
+        if self.moe_megakernel_backend is None and self.moe_megakernel_shared_expert_mode != "auto":
+            raise ValueError("moe_megakernel_shared_expert_mode requires a megakernel backend")
 
         if self.moe_megakernel_backend == "mok":
+            from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
+
+            fuse_shared = megakernel_fuses_shared_expert(self)
             # TODO: Add a materialized-wgrad adapter for non-fused accumulation.
             if not self.gradient_accumulation_fusion:
                 raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
@@ -2678,13 +2692,13 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK currently requires TP=1 and expert TP=1")
             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
-            if self.moe_shared_expert_intermediate_size is None:
-                raise ValueError("MOK requires a shared expert")
             if self.moe_shared_expert_overlap:
                 raise ValueError("MOK does not support MCore shared-expert overlap")
-            if self.moe_latent_size is not None:
-                raise ValueError("MOK does not support latent MoE")
-            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+            if (
+                fuse_shared
+                and self.recompute_modules
+                and "shared_experts" in self.recompute_modules
+            ):
                 raise ValueError(
                     "MOK does not support recompute_modules=['shared_experts']; shared-expert "
                     "computation is fused into the megakernel. Use whole-MoE recompute "
