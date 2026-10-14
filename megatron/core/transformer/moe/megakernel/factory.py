@@ -24,6 +24,7 @@ def megakernel_fuses_shared_expert(config: TransformerConfig) -> bool:
     mode = config.moe_megakernel_shared_expert_mode
     compatible = (
         config.moe_shared_expert_intermediate_size is not None
+        and config.tensor_model_parallel_size == 1
         and config.moe_latent_size is None
         and config.moe_shared_expert_intermediate_size == config.moe_ffn_hidden_size
         and not config.use_grouped_gemm_for_shared_expert
@@ -32,7 +33,7 @@ def megakernel_fuses_shared_expert(config: TransformerConfig) -> bool:
     if mode == "fused" and not compatible:
         raise ValueError(
             "Fused MOK shared execution requires a dense, non-interleaved shared MLP "
-            "with the routed intermediate size and no latent projection"
+            "with TP=1, the routed intermediate size, and no latent projection"
         )
     return mode != "native" and compatible
 
